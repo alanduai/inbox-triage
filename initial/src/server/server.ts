@@ -2,6 +2,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import { dataPath, isLoopback, type LoadedConfig } from "../config.js";
+import { ThreadNotes } from "../notes.js";
 import type { Pipeline } from "../pipeline.js";
 import { OPEN_STATUSES, type Item, type Store } from "../store/db.js";
 import { URGENCIES, type Urgency } from "../triage/schema.js";
@@ -100,6 +101,8 @@ async function readJson(req: http.IncomingMessage): Promise<Record<string, unkno
 
 export function createServer(deps: ServerDeps): http.Server {
   const { cfg, store } = deps;
+  // Dashboard choices reach the notes with or without Gmail.
+  const notes = deps.pipeline?.notes ?? new ThreadNotes(cfg, store, deps.vault);
   const projectName = (id: string) => cfg.projects.find((p) => p.id === id)?.name ?? id;
 
   return http.createServer(async (req, res) => {
@@ -226,19 +229,15 @@ export function createServer(deps: ServerDeps): http.Server {
           const status = body.status;
           if (status !== "no_reply_needed" && status !== "needs_reply" && status !== "done") return send(res, 400, { error: "bad status" });
           if (status === "needs_reply" && OPEN_STATUSES.includes(item.status)) return send(res, 200, { ok: true });
-          if (deps.pipeline) deps.pipeline.setStatus(item.id, status, "set in dashboard");
-          else if (status === "needs_reply") store.reopen(item.id);
-          else store.setStatus(item.id, status, "set in dashboard");
-          return send(res, 200, { ok: true });
+          const r = notes.setStatus(item.id, status, "set in dashboard");
+          return send(res, 200, { ok: true, noteUpdated: r?.noteUpdated ?? false });
         }
 
         if (req.method === "POST" && parts[3] === "urgency") {
           const body = await readJson(req);
           const u = body.urgency;
           if (u !== null && !(URGENCIES as readonly unknown[]).includes(u)) return send(res, 400, { error: "bad urgency" });
-          if (deps.pipeline) deps.pipeline.setUserUrgency(item.id, u as Urgency | null);
-          else store.setUserUrgency(item.id, u as Urgency | null);
-          return send(res, 200, { ok: true });
+          return send(res, 200, { ok: true, noteUpdated: notes.setUserUrgency(item.id, u as Urgency | null) });
         }
 
         if (req.method === "POST" && parts[3] === "retriage") {

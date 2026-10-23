@@ -274,7 +274,7 @@ test("L2-9: mail skipped for lack of a rule is checked again once the rules chan
 
 // ---------- L2-10 thread note fields and order ----------
 
-test("L2-10: the note's review flag follows the lead item, identity follows the newest, and late older mail sorts in", async () => {
+test("L2-10: the note's review flag and sender follow the lead item, and late older mail sorts in", async () => {
   const h = harness();
   h.answers.push(ok({ urgency: "urgent", urgency_score: 90 }), ok({ needs_reply: false, task: "", urgency: "fyi", suggested_reply: "", ack_reply: "" }));
   h.add(msg({ id: "10a", thread: "t10", from: "Registry <registry@court.example>", subject: "Kallelse", body: "court", at: T0 }));
@@ -283,13 +283,15 @@ test("L2-10: the note's review flag follows the lead item, identity follows the 
   let note = h.note(h.store.get("10a")!.notePath);
   assert.match(note, /review_required: true/);
   assert.match(note, /urgency: urgent/);
-  assert.match(note, /from: "Elin <elin@lawfirm.example>"/);
-  // An older message found later goes before the newer section, and the identity stays with the newest.
+  // The court's open, urgent letter leads, not Elin's fyi that came after it (L1-13).
+  assert.match(note, /from: "Registry <registry@court.example>"/);
+  // An older message found later goes before the newer section; the lead stays the urgent letter.
   h.add(msg({ id: "10c", thread: "t10", from: "Registry <registry@court.example>", subject: "Kallelse", body: "older", at: T0 - 3_600_000 }));
   await h.pipeline.pollOnce();
   note = h.note(h.store.get("10a")!.notePath);
   assert.ok(note.indexOf("older") < note.indexOf("> court"));
-  assert.match(note, /from: "Elin <elin@lawfirm.example>"/);
+  assert.match(note, /from: "Registry <registry@court.example>"/);
+  assert.ok(note.includes(JSON.stringify(h.store.get("10a")!.link)));
 });
 
 // ---------- L2-12 HTML text ----------

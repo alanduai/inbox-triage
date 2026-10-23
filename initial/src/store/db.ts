@@ -96,6 +96,8 @@ CREATE TABLE IF NOT EXISTS items (
   sender_verified INTEGER,
   reopened_at TEXT,
   full_text TEXT,
+  note_stale INTEGER NOT NULL DEFAULT 0,
+  file_attempts INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -173,6 +175,10 @@ export class Store {
     if (!cols.has("sender_verified")) this.db.exec("ALTER TABLE items ADD COLUMN sender_verified INTEGER");
     if (!cols.has("reopened_at")) this.db.exec("ALTER TABLE items ADD COLUMN reopened_at TEXT");
     if (!cols.has("full_text")) this.db.exec("ALTER TABLE items ADD COLUMN full_text TEXT");
+    // Whether the note is behind: 0 no, 1 its details (frontmatter, triage and attachment lines),
+    // 2 its checkbox too (the status changed). Set with the change, cleared once the note is written.
+    if (!cols.has("note_stale")) this.db.exec("ALTER TABLE items ADD COLUMN note_stale INTEGER NOT NULL DEFAULT 0");
+    if (!cols.has("file_attempts")) this.db.exec("ALTER TABLE items ADD COLUMN file_attempts INTEGER NOT NULL DEFAULT 0");
     // Thread notes are now kept per matter; carry over the first release's table.
     this.db.exec("INSERT OR IGNORE INTO thread_notes (thread_id, project_id, note_path, created_at) SELECT thread_id, project_id, note_path, created_at FROM threads");
     if (file !== ":memory:") fs.chmodSync(file, 0o600);
@@ -268,28 +274,34 @@ export class Store {
     return (this.db.prepare(`SELECT DISTINCT thread_id FROM items WHERE status IN (${open})`).all() as Row[]).map((r) => String(r.thread_id));
   }
 
-  /** Stores a triage. The status follows it only while the item is still waiting for one, so a choice you made stays. */
+  /**
+   * Stores a triage, unless the item already has one and is past triage (a second answer for the
+   * same message changes nothing). The status follows it only while the item is still waiting for
+   * one, so a choice you made stays.
+   */
   saveTriage(id: string, triage: Triage): void {
     const status = triagedStatus(triage);
-    this.db
+    const r = this.db
       .prepare(
-        "UPDATE items SET triage_json = ?, triage_error = '', status = CASE WHEN status IN ('pending_triage', 'triage_failed') THEN ? ELSE status END, updated_at = ? WHERE id = ?",
+        `UPDATE items SET triage_json = ?, triage_error = '', status = CASE WHEN status IN ('pending_triage', 'triage_failed') THEN ? ELSE status END,
+          note_stale = 2, updated_at = ? WHERE id = ? AND (triage_json IS NULL OR status IN ('pending_triage', 'triage_failed'))`,
       )
       .run(JSON.stringify(triage), status, new Date().toISOString(), id);
-    this.log(id, "triaged", `${triage.urgency} ${triage.urgency_score}`);
+    if (Number(r.changes)) this.log(id, "triaged", `${triage.urgency} ${triage.urgency_score}`);
   }
 
+  /** Records a failed triage; an item that already has a triage keeps it. */
   saveTriageError(id: string, error: string): void {
     this.db
       .prepare(
-        "UPDATE items SET triage_error = ?, status = CASE WHEN status = 'pending_triage' THEN 'triage_failed' ELSE status END, updated_at = ? WHERE id = ?",
+        "UPDATE items SET triage_error = ?, status = CASE WHEN status = 'pending_triage' THEN 'triage_failed' ELSE status END, note_stale = 2, updated_at = ? WHERE id = ? AND triage_json IS NULL",
       )
       .run(error, new Date().toISOString(), id);
     this.log(id, "triage_failed", error);
   }
 
   setStatus(id: string, status: Status, reason: string): void {
-    this.db.prepare("UPDATE items SET status = ?, updated_at = ? WHERE id = ?").run(status, new Date().toISOString(), id);
+    this.db.prepare("UPDATE items SET status = ?, note_stale = 2, updated_at = ? WHERE id = ?").run(status, new Date().toISOString(), id);
     this.log(id, "status", `${status}: ${reason}`);
   }
 
@@ -299,13 +311,40 @@ export class Store {
     if (!item) return;
     const status: Status = item.triage && !item.triage.needs_reply && item.triage.task ? "needs_action" : "needs_reply";
     const now = new Date().toISOString();
-    this.db.prepare("UPDATE items SET status = ?, reopened_at = ?, updated_at = ? WHERE id = ?").run(status, now, now, id);
+    this.db.prepare("UPDATE items SET status = ?, reopened_at = ?, note_stale = 2, updated_at = ? WHERE id = ?").run(status, now, now, id);
     this.log(id, "status", `${status}: reopened in dashboard`);
   }
 
-  /** Items whose note was never written (a failed write, or a stop during triage). */
+  /**
+   * Items whose note was never written (a failed write, or a stop during triage). Those tried least
+   * come first, so a message that can no longer be read never keeps the others waiting.
+   */
   unfiled(limit = 10): Item[] {
-    return (this.db.prepare("SELECT * FROM items WHERE note_path = '' ORDER BY received_at LIMIT ?").all(limit) as Row[]).map(toItem);
+    return (this.db.prepare("SELECT * FROM items WHERE note_path = '' ORDER BY file_attempts, received_at LIMIT ?").all(limit) as Row[]).map(toItem);
+  }
+
+  fileFailed(id: string): void {
+    this.db.prepare("UPDATE items SET file_attempts = file_attempts + 1 WHERE id = ?").run(id);
+  }
+
+  /** Threads whose note is behind the store, because a write failed or the service stopped. */
+  staleNotes(): { threadId: string; projectId: string }[] {
+    return (this.db.prepare("SELECT DISTINCT thread_id, project_id FROM items WHERE note_stale > 0 AND note_path != ''").all() as Row[]).map((r) => ({
+      threadId: String(r.thread_id),
+      projectId: String(r.project_id),
+    }));
+  }
+
+  /** Items of a thread whose status changed since its note was last written: their checkbox follows. */
+  statusChangedIds(threadId: string, projectId: string): string[] {
+    return (this.db.prepare("SELECT id FROM items WHERE thread_id = ? AND project_id = ? AND note_stale = 2").all(threadId, projectId) as Row[]).map((r) => String(r.id));
+  }
+
+  /** Marks a thread's note as written (false) or as behind (true; a checkbox already due stays due). */
+  setNoteStale(threadId: string, projectId: string, stale: boolean): void {
+    this.db
+      .prepare(`UPDATE items SET note_stale = ${stale ? "max(note_stale, 1)" : "0"} WHERE thread_id = ? AND project_id = ?`)
+      .run(threadId, projectId);
   }
 
   threadItems(threadId: string, projectId: string): Item[] {
@@ -317,18 +356,27 @@ export class Store {
   }
 
   setUserUrgency(id: string, urgency: Urgency | null): void {
-    this.db.prepare("UPDATE items SET user_urgency = ?, updated_at = ? WHERE id = ?").run(urgency, new Date().toISOString(), id);
+    this.db.prepare("UPDATE items SET user_urgency = ?, note_stale = max(note_stale, 1), updated_at = ? WHERE id = ?").run(urgency, new Date().toISOString(), id);
     this.log(id, "urgency_feedback", urgency ?? "cleared");
   }
 
   setAttachments(id: string, attachments: FiledAttachment[]): void {
-    this.db.prepare("UPDATE items SET attachments_json = ? WHERE id = ?").run(JSON.stringify(attachments), id);
+    this.db.prepare("UPDATE items SET attachments_json = ?, note_stale = max(note_stale, 1) WHERE id = ?").run(JSON.stringify(attachments), id);
   }
 
   /** The note for a thread within one matter: a thread involving two matters has a note in each. */
   threadNote(threadId: string, projectId: string): string | null {
     const row = this.db.prepare("SELECT note_path FROM thread_notes WHERE thread_id = ? AND project_id = ?").get(threadId, projectId) as Row | undefined;
     return row ? String(row.note_path) : null;
+  }
+
+  /** Whether another thread's note was given this path; it stays reserved after you delete the file. */
+  notePathTaken(notePath: string, threadId: string, projectId: string): boolean {
+    return (
+      this.db
+        .prepare("SELECT 1 FROM thread_notes WHERE note_path = ? COLLATE NOCASE AND NOT (thread_id = ? AND project_id = ?)")
+        .get(notePath, threadId, projectId) !== undefined
+    );
   }
 
   setThreadNote(threadId: string, projectId: string, notePath: string): void {

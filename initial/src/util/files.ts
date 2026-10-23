@@ -52,14 +52,3 @@ export function safeFileName(name: string, maxBytes = 180): string {
   const stem = keepExt ? cleaned.slice(0, -keepExt.length) : cleaned;
   return truncateBytes(stem, maxBytes - Buffer.byteLength(keepExt)).trimEnd() + keepExt;
 }
-
-/** a.pdf, then "a (2).pdf", "a (3).pdf"... */
-export function uniquePath(file: string): string {
-  if (!fs.existsSync(file)) return file;
-  const ext = path.extname(file);
-  const stem = file.slice(0, file.length - ext.length);
-  for (let i = 2; ; i++) {
-    const candidate = `${stem} (${i})${ext}`;
-    if (!fs.existsSync(candidate)) return candidate;
-  }
-}

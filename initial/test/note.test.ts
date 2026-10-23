@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { messageSection, newNote, replaceTaskLine, setTaskDone, taskLine, updateFrontmatter, yamlValue } from "../src/obsidian/note.js";
+import { messageSection, newNote, replaceAttachmentLine, replaceByHandTask, setTaskDone, taskLine, updateFrontmatter, yamlValue } from "../src/obsidian/note.js";
 import { cleanSubject, noteRelPath } from "../src/obsidian/writer.js";
 
 test("yaml values are quoted only when needed", () => {
@@ -26,9 +26,22 @@ test("task lines are found by block id", () => {
   const done = setTaskDone(content, "abc123", true);
   assert.match(done, /- \[x\] Triage this message by hand \^it-abc123/);
   assert.match(done, /- \[ \] my own task/);
-  const replaced = replaceTaskLine(done, "abc123", "- [ ] Send comments 📅 2026-10-26 ^it-abc123");
-  assert.match(replaced, /- \[ \] Send comments 📅 2026-10-26 \^it-abc123/);
+  const replaced = replaceByHandTask(done, "abc123", "- [ ] Send comments 📅 2026-10-26 ^it-abc123");
+  assert.match(replaced, /- \[ \] Send comments 📅 2026-10-26 \^it-abc123\n- \[ \] my own task/);
   assert.doesNotMatch(replaced, /Triage this message by hand/);
+  // Only the placeholder is swapped: a real task line, or one you edited, stays.
+  assert.equal(replaceByHandTask(replaced, "abc123", "- [ ] Something else ^it-abc123"), replaced);
+  // No task after triage: the placeholder goes.
+  assert.equal(replaceByHandTask(content, "abc123", ""), "# T\n\n- [ ] my own task\n");
+});
+
+test("ticking a task or swapping an attachment line keeps the blank line and your text below it", () => {
+  const note = "# T\n\n- [ ] Reply ^it-a1\n\nMy own paragraph.\n\n## 2026-10-24 10:00 · next\n";
+  const ticked = setTaskDone(note, "a1", true);
+  assert.equal(ticked, note.replace("- [ ]", "- [x]"));
+  assert.equal(setTaskDone(ticked, "a1", false), note);
+  const att = "**Attachments:**\n- x.pdf (0.1 MB): not saved yet ^at-a1-0\n\n- [ ] Reply ^it-a1\n";
+  assert.equal(replaceAttachmentLine(att, "a1", 0, "- [[p|x.pdf]]"), "**Attachments:**\n- [[p|x.pdf]]\n\n- [ ] Reply ^it-a1\n");
 });
 
 test("a section quotes the message and lists attachments", () => {

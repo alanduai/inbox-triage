@@ -13,7 +13,7 @@ Reads new Gmail from the people in your two private matters, triages each messag
 
 ## What happens to a message
 
-1. Every minute the service asks Gmail for new mail from the senders listed in `config.json`. Each check looks back a week, so mail that reaches the inbox late (rescued from spam, restored from trash) is still found. It searches all mail, so messages Superhuman auto-archived are found too. Your own mail and Superhuman's reminder emails are ignored.
+1. Every minute the service asks Gmail for new mail from the senders listed in `config.json`. The first start looks back `initialLookbackDays` (3 days); mail dated before that is never picked up. After that, each check looks back a week, so mail that reaches the inbox late (rescued from spam, restored from trash) is still found. It searches all mail, so messages Superhuman auto-archived are found too. Your own mail and Superhuman's reminder emails are ignored.
 2. Rules in the config decide the matter, the sender's role (your lawyer, the court, the other side, bank, advisor) and whether replies need review. Gmail's own sender check (DMARC, DKIM, SPF) is read too: mail that fails it is marked **Unverified sender**, because the From address may be forged.
 3. Claude (`claude-opus-5-5`) reads the message, any text it quotes or forwards (for example a court decision your lawyer forwarded), and up to six earlier messages in its thread. It returns:
    - a title, a summary, the urgency and the reason for it, the task, the due date and a reply-by time;
@@ -33,12 +33,16 @@ Reads new Gmail from the people in your two private matters, triages each messag
 
 ### The notes
 
-There is one note per email thread in each matter, for example `Projects/Sweden legal matter/2026-10-23 Draft statement.md`. A new message in the same thread is added in date order. You can rename or move a note in Obsidian; the app finds it again. Times are in the Mac mini's time zone, and the dashboard shows them in that zone even from a laptop set to another one.
+There is one note per email thread in each matter, for example `Projects/Sweden legal matter/2026-10-23 Draft statement.md`. A new message in the same thread is added in date order. Times are in the Mac mini's time zone, and the dashboard shows them in that zone even from a laptop set to another one.
+
+- **Moving and deleting.** You can rename or move a note in Obsidian; the app finds it again. If you delete one, the thread's next message starts a new note. The app writes only into a note that holds that thread, never into another file that now sits at the old path, and a deleted note's name is not given to a different thread.
+- **The frontmatter describes what needs you.** `status`, `urgency`, `reply_by`, `due`, `review_required`, `from` and the `gmail` link come from the most urgent open message in the thread, or from the latest one when nothing is open. So a court letter that still needs an answer stays on top of a later "fyi" from your lawyer. `subject` follows the newest message.
+- **If the vault can't be written** (Obsidian Sync busy, disk full), the change is kept and the note is updated on the next check. The dashboard says so when it happens.
 
 The app changes only three things in a note:
 - these frontmatter keys: `source`, `project`, `subject`, `gmail`, `from`, `status`, `urgency`, `reply_by`, `due`, `review_required`, `updated`;
-- the message sections it adds at the end;
-- its own task lines, which end in `^it-<message id>`.
+- the message sections it adds;
+- its own task lines, which end in `^it-<message id>`. It ticks one when that message is answered or marked done, and unticks it when you put the message back in the queue; a task you tick yourself stays ticked.
 
 Text and frontmatter keys you add yourself are left alone, so editing a note on your phone never conflicts with the service. Tasks use the Tasks plugin's `📅` due date and work as plain checkboxes without it.
 
@@ -145,5 +149,6 @@ The code is in `src/`:
 - `obsidian/`: notes and attachments
 - `store/`: SQLite
 - `server/`: dashboard
+- `notes.ts`: keeps each thread's note in line with the store
 - `pipeline.ts`: ties the pieces together
 - `doctor.ts`: setup checks

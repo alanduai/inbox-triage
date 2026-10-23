@@ -235,7 +235,10 @@ test("one unreadable message does not block the others, and an unfiled item is f
 
   const r = await pipeline.pollOnce();
   assert.equal(r.failed, 2, "the unreadable message and the failed write");
-  assert.equal(r.refiled, 1, "the stored item is finished in the same poll, without calling Claude again");
+  assert.equal(store.get("1c00000000000001")!.notePath, "");
+  // The next poll finishes the stored item first, without calling Claude again.
+  const r2 = await pipeline.pollOnce();
+  assert.equal(r2.refiled, 1);
   const item = store.get("1c00000000000001")!;
   assert.equal(item.status, "no_reply_needed");
   assert.ok(item.notePath && fs.existsSync(path.join(vaultDir, item.notePath)));

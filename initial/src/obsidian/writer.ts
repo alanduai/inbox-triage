@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { safeFileName, uniquePath, writeFileAtomic } from "../util/files.js";
+import { safeFileName, writeFileAtomic } from "../util/files.js";
 import type { FiledAttachment } from "../store/db.js";
 
 // Reply and forward prefixes in English, Swedish (SV, VB), Croatian (Odg) and German Outlook.
@@ -41,9 +41,17 @@ export class VaultWriter {
     writeFileAtomic(this.abs(rel), content);
   }
 
-  /** A free vault-relative path for a new note, never overwriting someone else's file. */
-  freeNotePath(rel: string): string {
-    return path.relative(this.vaultPath, uniquePath(this.abs(rel))).split(path.sep).join("/");
+  /**
+   * A free vault-relative path for a new note: no file there, and not taken, for example by
+   * another thread whose note you deleted. Never overwrites anything.
+   */
+  freeNotePath(rel: string, taken: (rel: string) => boolean = () => false): string {
+    const ext = path.posix.extname(rel);
+    const stem = rel.slice(0, rel.length - ext.length);
+    for (let i = 1; ; i++) {
+      const candidate = i === 1 ? rel : `${stem} (${i})${ext}`;
+      if (!this.exists(candidate) && !taken(candidate)) return candidate;
+    }
   }
 
   /**

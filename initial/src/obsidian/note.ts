@@ -92,24 +92,34 @@ export function updateFrontmatter(content: string, updates: Partial<Record<AppKe
 /** Ticks or unticks the app's own task line for an item. Returns the content unchanged if the line is gone. */
 export function setTaskDone(content: string, itemId: string, done: boolean): string {
   const id = blockId(itemId);
-  const re = new RegExp(`^(\\s*- \\[)[ xX](\\].*\\^${id})\\s*$`, "m");
+  // [ \t], not \s: a blank line after the task, and your text below it, must stay where they are.
+  const re = new RegExp(`^([ \\t]*- \\[)[ xX](\\].*\\^${id})[ \\t]*$`, "m");
   return content.replace(re, `$1${done ? "x" : " "}$2`);
 }
 
+const BY_HAND = "Triage this message by hand";
+
 /** The app's task line for an item: "- [ ] Task 📅 2026-10-26 ^it-<id>". */
-export function taskLine(itemId: string, triage: Triage | null): string {
-  const task = triage ? escapeMd(singleLine(triage.task)) : "Triage this message by hand";
+export function taskLine(itemId: string, triage: Triage | null, done = false): string {
+  const task = triage ? escapeMd(singleLine(triage.task)) : BY_HAND;
   if (!task) return "";
   const due = triage?.due_date ? ` 📅 ${triage.due_date}` : "";
-  // Every task starts open; it is ticked when you reply, finish it or mark it as needing nothing.
-  return `- [ ] ${task}${due} ^${blockId(itemId)}`;
+  // Open until you reply, finish it or mark it as needing nothing.
+  return `- [${done ? "x" : " "}] ${task}${due} ^${blockId(itemId)}`;
 }
 
-/** Swaps the app's task line for an item (after a retried triage). Adds it at the end if it is gone. */
-export function replaceTaskLine(content: string, itemId: string, line: string): string {
-  const re = new RegExp(`^\\s*- \\[[ xX]\\].*\\^${blockId(itemId)}\\s*$`, "m");
-  if (re.test(content)) return content.replace(re, line);
-  return line ? appendSection(content, `${line}\n`) : content;
+/**
+ * After a retried triage succeeds: swaps the "Triage this message by hand" line for the real task,
+ * or removes it when there is none. A task line you edited, or one already swapped, stays.
+ */
+export function replaceByHandTask(content: string, itemId: string, line: string): string {
+  const re = new RegExp(`^[ \\t]*- \\[[ xX]\\] ${BY_HAND} \\^${blockId(itemId)}[ \\t]*$\\n?`, "m");
+  return content.replace(re, line ? `${line}\n` : "");
+}
+
+/** Whether the note already holds an item's section: its task line or its Gmail link. */
+export function hasSection(content: string, itemId: string, link: string): boolean {
+  return new RegExp(`\\^${blockId(itemId)}[ \\t]*$`, "m").test(content) || content.includes(`(<${link}>)`);
 }
 
 /** The summary and urgency lines a successful triage adds to a message section. */
@@ -147,21 +157,28 @@ export function attachmentLine(itemId: string, a: FiledAttachment): string {
 
 /** Swaps the "not saved yet" line of an attachment for its saved line. */
 export function replaceAttachmentLine(content: string, itemId: string, index: number, line: string): string {
-  const re = new RegExp(`^- .*\\^at-${blockId(itemId).slice(3)}-${index}\\s*$`, "m");
+  const re = new RegExp(`^- .*\\^at-${blockId(itemId).slice(3)}-${index}[ \\t]*$`, "m");
   return content.replace(re, line);
 }
 
 const HEADING_STAMP = /^## (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) /;
 
 /**
- * Adds a message section in date order: before the first later section, else at the end. Your own
- * text between sections stays where it is.
+ * Adds a message section in date order: before the first section that is later, by its heading's
+ * minute or, within the same minute, by holding one of laterLinks (the Gmail links of later
+ * messages). Otherwise at the end. Your own text between sections stays where it is.
  */
-export function insertSection(content: string, section: string, stamp: string): string {
+export function insertSection(content: string, section: string, stamp: string, laterLinks: string[] = []): string {
   const lines = content.split("\n");
-  const at = lines.findIndex((l) => {
+  const holdsLater = (from: number) => {
+    for (let j = from + 1; j < lines.length && !HEADING_STAMP.test(lines[j]!); j++) {
+      if (laterLinks.some((link) => link && lines[j]!.includes(`(<${link}>)`))) return true;
+    }
+    return false;
+  };
+  const at = lines.findIndex((l, idx) => {
     const m = l.match(HEADING_STAMP);
-    return m !== null && m[1]! > stamp;
+    return m !== null && (m[1]! > stamp || (m[1] === stamp && holdsLater(idx)));
   });
   if (at === -1) return appendSection(content, section);
   const block = section.endsWith("\n") ? section : `${section}\n`;
@@ -183,6 +200,8 @@ export interface SectionInput {
   attachments: FiledAttachment[];
   triage: Triage | null;
   triageError: string;
+  // The item is closed already (answered, or marked in the dashboard), so its task starts ticked.
+  done?: boolean;
 }
 
 function quote(text: string): string {
@@ -217,7 +236,7 @@ export function messageSection(s: SectionInput): string {
     lines.push("");
   }
 
-  const task = taskLine(s.itemId, s.triage);
+  const task = taskLine(s.itemId, s.triage, s.done);
   if (task) lines.push(task, "");
   return lines.join("\n");
 }

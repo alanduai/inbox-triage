@@ -353,7 +353,11 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
   }
 
   function setStatus(id, status) {
-    api("POST", "/api/items/" + id + "/status", { status: status }).then(function () { toast(status === "no_reply_needed" ? "Marked as no reply needed. The note's task is ticked." : status === "done" ? "Done. The note's task is ticked." : "Back in the queue."); refresh(); }).catch(function (e) { toast(e.message); });
+    api("POST", "/api/items/" + id + "/status", { status: status }).then(function (r) {
+      var saved = status === "no_reply_needed" ? "Marked as no reply needed." : status === "done" ? "Done." : "Back in the queue.";
+      toast(r.noteUpdated === false ? saved + " The note couldn't be written just now; it is updated on the next check." : status === "needs_reply" ? saved : saved + " The note's task is ticked.");
+      refresh();
+    }).catch(function (e) { toast(e.message); });
   }
   function retriage(id) {
     toast("Running triage again…");
