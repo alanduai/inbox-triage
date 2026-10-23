@@ -5,9 +5,16 @@ import type { Role } from "../config.js";
 import type { Triage } from "../triage/claude.js";
 import type { Urgency } from "../triage/schema.js";
 
-export const STATUSES = ["pending_triage", "needs_reply", "no_reply_needed", "replied", "triage_failed"] as const;
+// Open: pending_triage, needs_reply, needs_action (a task without a reply), triage_failed.
+// Closed: replied, no_reply_needed, done (a needs_action task you finished).
+export const STATUSES = ["pending_triage", "needs_reply", "needs_action", "triage_failed", "replied", "no_reply_needed", "done"] as const;
 export type Status = (typeof STATUSES)[number];
-export const OPEN_STATUSES: Status[] = ["pending_triage", "needs_reply", "triage_failed"];
+export const OPEN_STATUSES: Status[] = ["pending_triage", "needs_reply", "needs_action", "triage_failed"];
+
+/** The open status a triage leads to: a reply, a task without a reply, or nothing to do. */
+export function triagedStatus(triage: Pick<Triage, "needs_reply" | "task">): Status {
+  return triage.needs_reply ? "needs_reply" : triage.task ? "needs_action" : "no_reply_needed";
+}
 
 export interface FiledAttachment {
   filename: string;
@@ -239,7 +246,7 @@ export class Store {
 
   /** Stores a triage. The status follows it only while the item is still waiting for one, so a choice you made stays. */
   saveTriage(id: string, triage: Triage): void {
-    const status: Status = triage.needs_reply ? "needs_reply" : "no_reply_needed";
+    const status = triagedStatus(triage);
     this.db
       .prepare(
         "UPDATE items SET triage_json = ?, triage_error = '', status = CASE WHEN status IN ('pending_triage', 'triage_failed') THEN ? ELSE status END, updated_at = ? WHERE id = ?",
@@ -262,11 +269,14 @@ export class Store {
     this.log(id, "status", `${status}: ${reason}`);
   }
 
-  /** Back in the queue by your choice: earlier replies no longer close it. */
+  /** Back in the queue by your choice: earlier replies no longer close it. A task without a reply reopens as a task. */
   reopen(id: string): void {
+    const item = this.get(id);
+    if (!item) return;
+    const status: Status = item.triage && !item.triage.needs_reply && item.triage.task ? "needs_action" : "needs_reply";
     const now = new Date().toISOString();
-    this.db.prepare("UPDATE items SET status = 'needs_reply', reopened_at = ?, updated_at = ? WHERE id = ?").run(now, now, id);
-    this.log(id, "status", "needs_reply: reopened in dashboard");
+    this.db.prepare("UPDATE items SET status = ?, reopened_at = ?, updated_at = ? WHERE id = ?").run(status, now, now, id);
+    this.log(id, "status", `${status}: reopened in dashboard`);
   }
 
   /** Items whose note was never written (a failed write, or a stop during triage). */
@@ -315,12 +325,16 @@ export class Store {
     this.db.prepare("INSERT INTO events (item_id, at, kind, detail) VALUES (?, ?, ?, ?)").run(itemId, new Date().toISOString(), kind, detail);
   }
 
-  /** How often you agreed with the urgent flag: the phase 1 measure. Items you never rated count as agreed. */
-  urgencyAgreement(sinceIso: string): { flaggedUrgent: number; disagreed: number; missedUrgent: number; agreementRate: number | null } {
+  /**
+   * How often you agreed with the urgent flag: the phase 1 measure. Only items you rated count,
+   * so the rate stays empty until you have rated some, instead of assuming agreement.
+   */
+  urgencyAgreement(sinceIso: string): { flaggedUrgent: number; rated: number; disagreed: number; missedUrgent: number; agreementRate: number | null } {
     const rows = this.db
       .prepare("SELECT triage_json, user_urgency FROM items WHERE triage_json IS NOT NULL AND received_at >= ?")
       .all(sinceIso) as Row[];
     let flagged = 0;
+    let rated = 0;
     let disagreed = 0;
     let missed = 0;
     for (const r of rows) {
@@ -328,9 +342,12 @@ export class Store {
       const user = r.user_urgency == null ? null : String(r.user_urgency);
       if (model === "urgent") {
         flagged++;
-        if (user && user !== "urgent") disagreed++;
+        if (user) {
+          rated++;
+          if (user !== "urgent") disagreed++;
+        }
       } else if (user === "urgent") missed++;
     }
-    return { flaggedUrgent: flagged, disagreed, missedUrgent: missed, agreementRate: flagged ? (flagged - disagreed) / flagged : null };
+    return { flaggedUrgent: flagged, rated, disagreed, missedUrgent: missed, agreementRate: rated ? (rated - disagreed) / rated : null };
   }
 }

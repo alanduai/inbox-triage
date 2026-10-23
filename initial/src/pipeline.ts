@@ -16,9 +16,9 @@ import {
 } from "./obsidian/note.js";
 import { cleanSubject, noteRelPath, type VaultWriter } from "./obsidian/writer.js";
 import { isOnlyCc, isOwner, gmailScopeQuery, matchContact, replyRoute } from "./scope.js";
-import { OPEN_STATUSES, type FiledAttachment, type Item, type Status, type Store } from "./store/db.js";
+import { OPEN_STATUSES, triagedStatus, type FiledAttachment, type Item, type Status, type Store } from "./store/db.js";
 import { callClaude, finalize, TriageError, type Triage } from "./triage/claude.js";
-import { URGENCIES } from "./triage/schema.js";
+import { URGENCIES, type Urgency } from "./triage/schema.js";
 import { localIso, localStamp, log } from "./util/time.js";
 
 const LAST_SEEN_KEY = "gmail.lastSeenEpoch";
@@ -307,7 +307,8 @@ export class Pipeline {
       }
       const sentTimes = meta.filter((m) => isSentReply(m.labelIds)).map((m) => m.internalDate.getTime());
       for (const item of this.store.openInThread(threadId)) {
-        if (item.status === "pending_triage") continue;
+        // A reply closes what asked for a reply; a task without a reply (needs_action) waits for you.
+        if (item.status === "pending_triage" || item.status === "needs_action") continue;
         const after = Math.max(new Date(item.receivedAt).getTime(), item.reopenedAt ? new Date(item.reopenedAt).getTime() : 0);
         if (sentTimes.some((t) => t > after)) {
           this.setStatus(item.id, "replied", "reply found in Gmail");
@@ -327,12 +328,19 @@ export class Pipeline {
     const item = this.store.get(id);
     if (!item?.notePath || !this.vault.exists(item.notePath)) return item;
     try {
-      this.vault.write(item.notePath, setTaskDone(this.vault.read(item.notePath), id, status === "replied" || status === "no_reply_needed"));
+      this.vault.write(item.notePath, setTaskDone(this.vault.read(item.notePath), id, !OPEN_STATUSES.includes(item.status)));
       this.syncNoteStatus(item.threadId);
     } catch (err) {
       log(`could not update note for ${id}`, err);
     }
     return item;
+  }
+
+  /** Your own urgency rating: it replaces Claude's in the dashboard and in the note. */
+  setUserUrgency(id: string, urgency: Urgency | null): void {
+    this.store.setUserUrgency(id, urgency);
+    const item = this.store.get(id);
+    if (item) this.syncNoteStatus(item.threadId);
   }
 
   /**
@@ -344,12 +352,16 @@ export class Pipeline {
     const notePath = this.store.threadNote(threadId);
     if (!items.length || !notePath || !this.vault.exists(notePath)) return;
     const open = items.filter((i) => OPEN_STATUSES.includes(i.status));
-    const rank = (i: Item) => (i.triage ? URGENCIES.indexOf(i.triage.urgency) : URGENCIES.length);
+    const urgencyOf = (i: Item) => i.userUrgency ?? i.triage?.urgency;
+    const rank = (i: Item) => {
+      const u = urgencyOf(i);
+      return u ? URGENCIES.indexOf(u) : URGENCIES.length;
+    };
     const lead = open.length ? [...open].sort((a, b) => rank(a) - rank(b))[0]! : items[items.length - 1]!;
     try {
       const content = updateFrontmatter(this.vault.read(notePath), {
         status: lead.status,
-        urgency: lead.triage?.urgency ?? "",
+        urgency: urgencyOf(lead) ?? "",
         reply_by: lead.triage?.reply_by ?? "",
         due: lead.triage?.due_date ?? "",
         updated: localIso(new Date(), this.cfg.tz),

@@ -102,7 +102,7 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
 
   <div class="kpis">
     <div class="kpi"><div class="l">Urgent</div><div class="v" id="k-urgent">—</div><div class="muted">Open, needing your reply</div></div>
-    <div class="kpi"><div class="l">Need your reply</div><div class="v" id="k-reply">—</div><div class="muted">In scope, not yet answered</div></div>
+    <div class="kpi"><div class="l">Need your reply</div><div class="v" id="k-reply">—</div><div class="muted" id="k-reply-note">In scope, not yet answered</div></div>
     <div class="kpi"><div class="l">Oldest unanswered</div><div class="v"><span id="k-oldest">—</span><span class="muted"> h</span></div><div class="muted">Hours since it arrived</div></div>
     <div class="kpi"><div class="l">Urgent flags you agreed with</div><div class="v" id="k-agree">—</div><div class="muted" id="k-agree-note">Last 14 days</div></div>
   </div>
@@ -134,9 +134,11 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
 
 <script nonce="__NONCE__">
 (function () {
-  var S = { view: "open", project: "", items: [], sel: null, detail: null, summary: null, saveTimer: null };
+  // One save timer per item, so switching messages never cancels a pending save of another draft.
+  var S = { view: "open", project: "", items: [], sel: null, detail: null, summary: null, saveTimers: {} };
   var URG = { urgent: ["Urgent", 0, "u-urgent"], today: ["Today", 1, "u-today"], week: ["This week", 2, "u-week"], fyi: ["FYI", 3, "u-fyi"] };
-  var STATUS = { pending_triage: "Triage pending", needs_reply: "Needs reply", no_reply_needed: "No reply needed", replied: "Replied", triage_failed: "Triage failed" };
+  var STATUS = { pending_triage: "Triage pending", needs_reply: "Needs reply", needs_action: "Action needed", no_reply_needed: "No reply needed", replied: "Replied", done: "Done", triage_failed: "Triage failed" };
+  var OPEN = { pending_triage: true, needs_reply: true, needs_action: true, triage_failed: true };
 
   function $(id) { return document.getElementById(id); }
   function el(tag, cls, text) { var n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; }
@@ -165,10 +167,13 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
       $("k-urgent").textContent = String(s.urgentOpen);
       $("k-urgent").classList.toggle("bad", s.urgentOpen > 0);
       $("k-reply").textContent = String(s.needsReply);
+      $("k-reply-note").textContent = s.needsAction ? "Plus " + s.needsAction + " task" + (s.needsAction === 1 ? "" : "s") + " without a reply" : "In scope, not yet answered";
       $("k-oldest").textContent = String(s.oldestUnansweredHours);
       var a = s.agreement;
       $("k-agree").textContent = a.agreementRate == null ? "—" : Math.round(a.agreementRate * 100) + "%";
-      $("k-agree-note").textContent = "Last 14 days: " + a.flaggedUrgent + " flagged, " + a.disagreed + " corrected" + (a.missedUrgent ? ", " + a.missedUrgent + " missed" : "");
+      $("k-agree-note").textContent = a.rated
+        ? "Last 14 days: " + a.rated + " of " + a.flaggedUrgent + " urgent flags rated, " + a.disagreed + " wrong" + (a.missedUrgent ? ", " + a.missedUrgent + " missed" : "")
+        : "Rate urgent items to start the measure (" + a.flaggedUrgent + " flagged in 14 days)";
       $("take").textContent = s.urgentOpen ? (s.urgentOpen === 1 ? "1 urgent message needs your reply." : s.urgentOpen + " urgent messages need your reply.") : (s.needsReply ? "Nothing urgent. " + s.needsReply + " to answer." : "Nothing waiting on you.");
       if (s.triageFailed) $("take").textContent += " " + s.triageFailed + " could not be triaged; open them to retry.";
       $("poll").textContent = s.lastPoll ? ((s.lastPoll.ok ? "Checked Gmail " : "Gmail check failed ") + when(s.lastPoll.at) + (s.lastPoll.ok ? "" : ": " + s.lastPoll.message)) : "Gmail not checked yet";
@@ -207,7 +212,8 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
       if (i.onlyCc) meta.appendChild(el("span", "chip", "cc"));
       if (i.reviewRequired) meta.appendChild(el("span", "chip warn", "Review required"));
       if (i.replyBy && i.status === "needs_reply") meta.appendChild(el("span", "muted", "Reply by " + localWhen(i.replyBy)));
-      if (i.status !== "needs_reply") meta.appendChild(el("span", "chip " + (i.status === "triage_failed" ? "warn" : "ok"), STATUS[i.status] || i.status));
+      if (i.status === "needs_action") meta.appendChild(el("span", "chip warn", STATUS[i.status]));
+      else if (i.status !== "needs_reply") meta.appendChild(el("span", "chip " + (i.status === "triage_failed" ? "warn" : "ok"), STATUS[i.status] || i.status));
       b.appendChild(top); b.appendChild(el("div", "ttl", i.title)); b.appendChild(meta);
       b.addEventListener("click", function () { S.sel = i.id; renderList(); loadDetail(i.id); });
       list.appendChild(b);
@@ -217,7 +223,7 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
   function renderProjects() {
     var by = {};
     (S.summary ? S.summary.projects : []).forEach(function (p) { by[p.id] = { name: p.name, folder: p.folder, open: 0, urgent: 0 }; });
-    if (S.view === "open") S.items.forEach(function (i) { var p = by[i.projectId]; if (!p) return; p.open++; if (i.urgency === "urgent" && i.status === "needs_reply") p.urgent++; });
+    if (S.view === "open") S.items.forEach(function (i) { var p = by[i.projectId]; if (!p) return; p.open++; if (i.urgency === "urgent" && (i.status === "needs_reply" || i.status === "needs_action")) p.urgent++; });
     var tb = $("projects"); tb.replaceChildren();
     Object.keys(by).forEach(function (id) {
       var p = by[id], tr = el("tr");
@@ -243,7 +249,7 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
     if (d.senderVerified === false) top.appendChild(el("span", "chip bad", "Unverified sender"));
     if (d.onlyCc) top.appendChild(el("span", "chip", "You were in cc"));
     if (d.reviewRequired) top.appendChild(el("span", "chip warn", "Review required"));
-    top.appendChild(el("span", "chip " + (d.status === "triage_failed" ? "warn" : d.status === "needs_reply" ? "" : "ok"), STATUS[d.status] || d.status));
+    top.appendChild(el("span", "chip " + (d.status === "triage_failed" || d.status === "needs_action" ? "warn" : d.status === "needs_reply" ? "" : "ok"), STATUS[d.status] || d.status));
     box.appendChild(top);
     box.appendChild(el("h2", "", d.title));
     if (t && t.title !== d.subject) box.appendChild(el("p", "muted", "Subject: " + d.subject));
@@ -265,9 +271,11 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
       w.appendChild(dl); why.appendChild(w);
       var fbRow = el("div", "row"); fbRow.appendChild(el("span", "muted", "Right urgency?"));
       var sel = el("select"); sel.setAttribute("aria-label", "Your urgency");
-      sel.appendChild(new Option("Yes, " + (URG[t.urgency] || ["?"])[0].toLowerCase(), ""));
+      // Not rated, an explicit yes (your rating equals Claude's), or a correction.
+      sel.appendChild(new Option("Not rated yet", ""));
+      sel.appendChild(new Option("Yes, " + (URG[t.urgency] || ["?"])[0].toLowerCase(), t.urgency));
       Object.keys(URG).forEach(function (k) { if (k !== t.urgency) sel.appendChild(new Option("No, it is " + URG[k][0].toLowerCase(), k)); });
-      sel.value = d.userUrgency && d.userUrgency !== t.urgency ? d.userUrgency : "";
+      sel.value = d.userUrgency || "";
       sel.addEventListener("change", function () { api("POST", "/api/items/" + d.id + "/urgency", { urgency: sel.value || null }).then(function () { toast("Thanks. This counts toward the agreement rate."); loadSummary(); }).catch(function (e) { toast(e.message); }); });
       fbRow.appendChild(sel); why.appendChild(fbRow);
       box.appendChild(why);
@@ -299,8 +307,9 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
       var ta = el("textarea"); ta.value = d.draft != null ? d.draft : t.suggested_reply; ta.setAttribute("aria-label", "Reply");
       var state = el("span", "muted", d.draft != null && d.draft !== t.suggested_reply ? "Edited" : "");
       ta.addEventListener("input", function () {
-        state.textContent = "Saving…"; clearTimeout(S.saveTimer);
-        S.saveTimer = setTimeout(function () { api("PUT", "/api/items/" + d.id + "/draft", { text: ta.value }).then(function () { state.textContent = "Edited, saved"; }).catch(function (e) { state.textContent = ""; toast(e.message); }); }, 700);
+        state.textContent = "Saving…"; clearTimeout(S.saveTimers[d.id]);
+        var text = ta.value;
+        S.saveTimers[d.id] = setTimeout(function () { delete S.saveTimers[d.id]; api("PUT", "/api/items/" + d.id + "/draft", { text: text }).then(function () { state.textContent = "Edited, saved"; }).catch(function (e) { state.textContent = ""; toast(e.message); }); }, 700);
       });
       rp.appendChild(ta);
       var row = el("div", "row");
@@ -324,14 +333,15 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
     }
 
     var act = el("div", "row");
-    if (d.status === "needs_reply" || d.status === "triage_failed" || d.status === "pending_triage") act.appendChild(btn("No reply needed", "", function () { setStatus(d.id, "no_reply_needed"); }));
+    if (d.status === "needs_action") act.appendChild(btn("Mark done", "p", function () { setStatus(d.id, "done"); }));
+    if (d.status === "needs_reply" || d.status === "triage_failed" || d.status === "pending_triage" || d.status === "needs_action") act.appendChild(btn("No reply needed", "", function () { setStatus(d.id, "no_reply_needed"); }));
     else act.appendChild(btn("Back to the queue", "", function () { setStatus(d.id, "needs_reply"); }));
     act.appendChild(el("span", "muted", "Replies you send from Gmail or Superhuman close the item on the next check."));
     box.appendChild(act);
   }
 
   function setStatus(id, status) {
-    api("POST", "/api/items/" + id + "/status", { status: status }).then(function () { toast(status === "no_reply_needed" ? "Marked as no reply needed. The note's task is ticked." : "Back in the queue."); refresh(); }).catch(function (e) { toast(e.message); });
+    api("POST", "/api/items/" + id + "/status", { status: status }).then(function () { toast(status === "no_reply_needed" ? "Marked as no reply needed. The note's task is ticked." : status === "done" ? "Done. The note's task is ticked." : "Back in the queue."); refresh(); }).catch(function (e) { toast(e.message); });
   }
   function retriage(id) {
     toast("Running triage again…");

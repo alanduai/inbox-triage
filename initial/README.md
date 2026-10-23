@@ -26,7 +26,10 @@ Reads new Gmail from the people in your two private matters, triages each messag
    - An unverified sender gets no acknowledgement and is never raised to urgent.
    - Facts only you know are left as `[brackets]`.
 5. The message is filed in the vault. Attachments are saved in the matter's `attachments/` folder, except files over your Obsidian Sync limit, which stay in `data/large-attachments/` and are linked from the note.
-6. The dashboard lists open items, urgent first. Mark each one's urgency as right or wrong. The share of urgent flags you agree with is the phase 1 measure; the target is 90% or more.
+6. The dashboard lists open items, urgent first.
+   - A message that needs a reply shows as **Needs reply**. One that needs something done but no reply (for example, upload documents to a portal) shows as **Action needed**; press **Mark done** when it's finished.
+   - Rate each urgent item's urgency: **Yes**, or the level it should have been. Your rating replaces Claude's in the queue and in the note.
+   - The phase 1 measure is the share of rated urgent flags you agreed with; unrated items don't count. The target is 90% or more.
 
 ### The notes
 

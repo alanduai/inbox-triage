@@ -10,6 +10,8 @@ import { log } from "../util/time.js";
 import { dashboardHtml } from "./ui.js";
 
 const COOKIE = "it_token";
+
+class BadRequest extends Error {}
 const MAX_BODY = 1_000_000;
 
 export interface ServerDeps {
@@ -31,7 +33,9 @@ function summaryOf(item: Item, projectName: string) {
     subject: item.subject,
     title: item.triage?.title ?? item.subject,
     receivedAt: item.receivedAt,
-    urgency: item.triage?.urgency ?? null,
+    // Your own rating wins; Claude's stays visible as modelUrgency.
+    urgency: item.userUrgency ?? item.triage?.urgency ?? null,
+    modelUrgency: item.triage?.urgency ?? null,
     urgencyScore: item.triage?.urgency_score ?? null,
     replyBy: item.triage?.reply_by ?? "",
     status: item.status,
@@ -82,7 +86,14 @@ async function readJson(req: http.IncomingMessage): Promise<Record<string, unkno
     chunks.push(chunk as Buffer);
   }
   const text = Buffer.concat(chunks).toString("utf8");
-  return text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  if (!text) return {};
+  try {
+    const json = JSON.parse(text) as unknown;
+    if (!json || typeof json !== "object" || Array.isArray(json)) throw new Error();
+    return json as Record<string, unknown>;
+  } catch {
+    throw new BadRequest("The request body is not a JSON object");
+  }
 }
 
 export function createServer(deps: ServerDeps): http.Server {
@@ -144,14 +155,16 @@ export function createServer(deps: ServerDeps): http.Server {
       if (req.method === "GET" && parts[1] === "summary") {
         const open = store.list("open");
         const needsReply = open.filter((i) => i.status === "needs_reply");
+        const needsYou = open.filter((i) => i.status === "needs_reply" || i.status === "needs_action");
         const now = Date.now();
         const since = new Date(now - 14 * 86_400_000).toISOString();
         let doctor: unknown = null;
         const doctorFile = dataPath(cfg, "doctor.json");
         if (fs.existsSync(doctorFile)) doctor = JSON.parse(fs.readFileSync(doctorFile, "utf8"));
         return send(res, 200, {
-          urgentOpen: needsReply.filter((i) => i.triage?.urgency === "urgent").length,
+          urgentOpen: needsYou.filter((i) => (i.userUrgency ?? i.triage?.urgency) === "urgent").length,
           needsReply: needsReply.length,
+          needsAction: needsYou.length - needsReply.length,
           oldestUnansweredHours: needsReply.length
             ? Math.floor((now - Math.min(...needsReply.map((i) => new Date(i.receivedAt).getTime()))) / 3_600_000)
             : 0,
@@ -203,7 +216,7 @@ export function createServer(deps: ServerDeps): http.Server {
         if (req.method === "POST" && parts[3] === "status") {
           const body = await readJson(req);
           const status = body.status;
-          if (status !== "no_reply_needed" && status !== "needs_reply") return send(res, 400, { error: "bad status" });
+          if (status !== "no_reply_needed" && status !== "needs_reply" && status !== "done") return send(res, 400, { error: "bad status" });
           if (status === "needs_reply" && OPEN_STATUSES.includes(item.status)) return send(res, 200, { ok: true });
           if (deps.pipeline) deps.pipeline.setStatus(item.id, status, "set in dashboard");
           else if (status === "needs_reply") store.reopen(item.id);
@@ -215,7 +228,8 @@ export function createServer(deps: ServerDeps): http.Server {
           const body = await readJson(req);
           const u = body.urgency;
           if (u !== null && !(URGENCIES as readonly unknown[]).includes(u)) return send(res, 400, { error: "bad urgency" });
-          store.setUserUrgency(item.id, u as Urgency | null);
+          if (deps.pipeline) deps.pipeline.setUserUrgency(item.id, u as Urgency | null);
+          else store.setUserUrgency(item.id, u as Urgency | null);
           return send(res, 200, { ok: true });
         }
 
@@ -233,6 +247,10 @@ export function createServer(deps: ServerDeps): http.Server {
 
       return send(res, 404, { error: "not found" });
     } catch (err) {
+      if (err instanceof BadRequest) {
+        if (!res.headersSent) send(res, 400, { error: err.message });
+        return;
+      }
       log("dashboard request failed", err);
       if (!res.headersSent) send(res, 500, { error: "internal error" });
     }

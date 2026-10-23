@@ -91,8 +91,8 @@ export function taskLine(itemId: string, triage: Triage | null): string {
   const task = triage ? escapeMd(singleLine(triage.task)) : "Triage this message by hand";
   if (!task) return "";
   const due = triage?.due_date ? ` 📅 ${triage.due_date}` : "";
-  const done = triage && !triage.needs_reply ? "x" : " ";
-  return `- [${done}] ${task}${due} ^${blockId(itemId)}`;
+  // Every task starts open; it is ticked when you reply, finish it or mark it as needing nothing.
+  return `- [ ] ${task}${due} ^${blockId(itemId)}`;
 }
 
 /** Swaps the app's task line for an item (after a retried triage). Adds it at the end if it is gone. */
