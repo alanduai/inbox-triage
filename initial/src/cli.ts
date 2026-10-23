@@ -1,0 +1,143 @@
+#!/usr/bin/env node
+import { randomBytes } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import Anthropic from "@anthropic-ai/sdk";
+import { dataPath, defaultConfigPath, loadConfig, type LoadedConfig } from "./config.js";
+import { doctor, printReport } from "./doctor.js";
+import { authorizedClient, runAuthFlow } from "./gmail/auth.js";
+import { GmailReader } from "./gmail/client.js";
+import { VaultWriter } from "./obsidian/writer.js";
+import { Pipeline } from "./pipeline.js";
+import { createServer } from "./server/server.js";
+import { Store } from "./store/db.js";
+import { anthropicApiKey } from "./util/secrets.js";
+import { log } from "./util/time.js";
+
+const HELP = `inbox-triage <command>
+
+  init              create config.json from the example and the private data folder
+  auth              sign in to Gmail (read-only) and store the token
+  doctor [--online] check the setup on this machine; --online also tests Gmail and Claude
+  poll              check Gmail once, triage and file new messages, then exit
+  run               start the dashboard and check Gmail every few minutes (the service)
+  token             print a new dashboard token, for access from your network
+`;
+
+function openStore(cfg: LoadedConfig): Store {
+  return new Store(dataPath(cfg, "inbox.db"));
+}
+
+function vaultWriter(cfg: LoadedConfig): VaultWriter {
+  return new VaultWriter(cfg.vault.path, cfg.vault.maxSyncFileMB * 1_000_000, dataPath(cfg, cfg.vault.largeAttachmentDir));
+}
+
+function makePipeline(cfg: LoadedConfig, store: Store): Pipeline {
+  if (!fs.existsSync(cfg.vault.path)) throw new Error(`Vault not found at ${cfg.vault.path}`);
+  const gmail = new GmailReader(authorizedClient(cfg));
+  const claude = new Anthropic({ apiKey: anthropicApiKey(cfg) });
+  return new Pipeline(cfg, store, gmail, claude, vaultWriter(cfg));
+}
+
+async function main(argv: string[]): Promise<number> {
+  const [command, ...rest] = argv;
+  switch (command) {
+    case "init": {
+      const target = defaultConfigPath();
+      const example = path.resolve(path.dirname(target), "config.example.json");
+      if (fs.existsSync(target)) console.log(`${target} already exists; left as it is.`);
+      else {
+        fs.copyFileSync(example, target);
+        fs.chmodSync(target, 0o600);
+        console.log(`Created ${target}. Fill it in, then run: npm run doctor`);
+      }
+      fs.mkdirSync(path.resolve(path.dirname(target), "data"), { recursive: true, mode: 0o700 });
+      return 0;
+    }
+    case "token":
+      console.log(randomBytes(24).toString("base64url"));
+      return 0;
+    case "auth": {
+      const cfg = loadConfig();
+      const scopes = await runAuthFlow(cfg);
+      console.log(`Gmail authorized with: ${scopes.join(", ")}`);
+      return 0;
+    }
+    case "doctor": {
+      const report = await doctor(loadConfig(), { online: rest.includes("--online") });
+      printReport(report);
+      return report.checks.some((c) => c.level === "fail") ? 1 : 0;
+    }
+    case "poll": {
+      const cfg = loadConfig();
+      const store = openStore(cfg);
+      try {
+        const r = await makePipeline(cfg, store).pollOnce();
+        console.log(`matched ${r.matched}, filed ${r.ingested}, failed ${r.failed}, closed by your replies ${r.closedByReply}`);
+        return r.failed ? 1 : 0;
+      } finally {
+        store.close();
+      }
+    }
+    case "run":
+      return runService();
+    default:
+      console.log(HELP);
+      return command ? 1 : 0;
+  }
+}
+
+async function runService(): Promise<number> {
+  const cfg = loadConfig();
+  const store = openStore(cfg);
+  let pipeline: Pipeline | null = null;
+  let lastPoll: { at: string; ok: boolean; message: string } | null = null;
+  try {
+    pipeline = makePipeline(cfg, store);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log(`Gmail checks are off: ${message}. The dashboard still runs.`);
+    lastPoll = { at: new Date().toISOString(), ok: false, message };
+  }
+
+  const server = createServer({ cfg, store, pipeline, vault: vaultWriter(cfg), lastPoll: () => lastPoll });
+  await new Promise<void>((resolve) => server.listen(cfg.dashboard.port, cfg.dashboard.host, resolve));
+  log(`dashboard on http://${cfg.dashboard.host}:${cfg.dashboard.port}`);
+
+  let timer: NodeJS.Timeout | undefined;
+  let stopping = false;
+  const tick = async () => {
+    if (!pipeline || stopping) return;
+    try {
+      const r = await pipeline.pollOnce();
+      lastPoll = { at: new Date().toISOString(), ok: r.failed === 0, message: `${r.ingested} new, ${r.failed} failed, ${r.closedByReply} closed by your replies` };
+      if (r.ingested || r.failed || r.closedByReply) log(`poll: ${lastPoll.message}`);
+    } catch (err) {
+      lastPoll = { at: new Date().toISOString(), ok: false, message: err instanceof Error ? err.message : String(err) };
+      log("poll failed", err);
+    } finally {
+      if (!stopping) timer = setTimeout(tick, cfg.gmail.pollSeconds * 1000);
+    }
+  };
+  void tick();
+
+  await new Promise<void>((resolve) => {
+    const stop = () => {
+      stopping = true;
+      if (timer) clearTimeout(timer);
+      server.close(() => resolve());
+    };
+    process.once("SIGTERM", stop);
+    process.once("SIGINT", stop);
+  });
+  store.close();
+  return 0;
+}
+
+main(process.argv.slice(2)).then(
+  (code) => process.exit(code),
+  (err) => {
+    console.error(err instanceof Error ? err.message : err);
+    process.exit(1);
+  },
+);
