@@ -10,7 +10,13 @@ export type Language = (typeof LANGUAGES)[number];
 
 const Contact = z.object({
   // An exact address ("name@firm.se") or a domain ("@firm.se", which also covers subdomains).
-  match: z.string().min(3),
+  match: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .regex(/^([^\s@<>"(),;:]+)?@[a-z0-9-]+(\.[a-z0-9-]+)+$/, {
+      message: 'must be an address ("name@firm.se") or a domain starting with "@" ("@firm.se")',
+    }),
   role: z.enum(ROLES).default("other"),
   // Replies need a second confirmation and get no quick acknowledgement (court, the other side's lawyers).
   reviewRequired: z.boolean().default(false),
@@ -107,9 +113,20 @@ export function parseConfig(raw: unknown, configPath: string): LoadedConfig {
   const cfg = result.data;
   const base = path.dirname(configPath);
   const ids = new Set<string>();
+  const owners = new Map<string, string>();
   for (const p of cfg.projects) {
     if (ids.has(p.id)) throw new Error(`Duplicate project id "${p.id}" in ${configPath}`);
     ids.add(p.id);
+    // The same sender in two matters would always go to the first one: refuse it.
+    for (const c of p.contacts) {
+      const other = owners.get(c.match);
+      if (other && other !== p.id) throw new Error(`"${c.match}" is listed in both "${other}" and "${p.id}" in ${configPath}`);
+      owners.set(c.match, p.id);
+    }
+    // Drafts answering the court or the other side go to your own lawyer, so one must be named.
+    if (!p.counsel && p.contacts.some((c) => c.role === "court" || c.role === "opposing_counsel")) {
+      throw new Error(`Project "${p.id}" has court or opposing-counsel contacts but no "counsel" (your own lawyer) in ${configPath}`);
+    }
   }
   if (!isLoopback(cfg.dashboard.host) && !cfg.dashboard.token) {
     throw new Error(`dashboard.token is required when dashboard.host is ${cfg.dashboard.host} (reachable from your network)`);

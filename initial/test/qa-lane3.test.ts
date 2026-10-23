@@ -108,7 +108,7 @@ test("a malformed request body is a 400, not a server error", async () => {
   const now = new Date().toISOString();
   store.insert({
     id: "4a", channel: "gmail", threadId: "4a", projectId: "croatia-bank", role: "bank", fromName: "", fromEmail: "a@bank.example", to: [], cc: [], subject: "s",
-    receivedAt: now, body: "", onlyCc: false, senderVerified: true, replyToName: "", replyToEmail: "", replyRedirected: false, replyLanguage: "", link: "",
+    receivedAt: now, body: "", fullText: "", onlyCc: false, senderVerified: true, replyToName: "", replyToEmail: "", replyRedirected: false, replyLanguage: "", link: "",
     attachments: [], notePath: "", status: "needs_reply", triage: null, triageError: "", draft: null, userUrgency: null, reopenedAt: null, createdAt: now, updatedAt: now,
   });
   const { server, base: url } = await serve(store);

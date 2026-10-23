@@ -2,6 +2,14 @@ import { gmail, type gmail_v1 } from "@googleapis/gmail";
 import type { OAuth2Client } from "google-auth-library";
 import { completeBody, decodeBase64Url, parseAddressList, parseMessage, type AttachmentRef, type ParsedMessage } from "./parse.js";
 
+export interface ThreadMeta {
+  id: string;
+  internalDate: Date;
+  labelIds: string[];
+  fromEmail: string;
+  recipients: string[];
+}
+
 /** The few Gmail calls phase 1 needs. Read-only. */
 export class GmailReader {
   private readonly api: gmail_v1.Gmail;
@@ -52,16 +60,18 @@ export class GmailReader {
     return completeBody(msg, fetched);
   }
 
-  /** Light view of a thread: who wrote each message and when, without bodies. */
-  async threadMeta(id: string): Promise<{ id: string; internalDate: Date; labelIds: string[]; fromEmail: string }[]> {
-    const res = await this.api.users.threads.get({ userId: "me", id, format: "metadata", metadataHeaders: ["From"] });
+  /** Light view of a thread: who wrote each message, to whom and when, without bodies. */
+  async threadMeta(id: string): Promise<ThreadMeta[]> {
+    const res = await this.api.users.threads.get({ userId: "me", id, format: "metadata", metadataHeaders: ["From", "To", "Cc"] });
     return (res.data.messages ?? []).map((m) => {
-      const from = m.payload?.headers?.find((h) => h.name?.toLowerCase() === "from")?.value ?? "";
+      const h = (name: string) =>
+        (m.payload?.headers ?? []).filter((x) => x.name?.toLowerCase() === name).map((x) => x.value ?? "").join(", ");
       return {
         id: m.id ?? "",
         internalDate: new Date(Number(m.internalDate ?? 0)),
         labelIds: m.labelIds ?? [],
-        fromEmail: parseAddressList(from)[0]?.email ?? "",
+        fromEmail: parseAddressList(h("from"))[0]?.email ?? "",
+        recipients: [...parseAddressList(h("to")), ...parseAddressList(h("cc"))].map((a) => a.email),
       };
     });
   }

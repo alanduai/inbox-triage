@@ -1,12 +1,17 @@
+import fs from "node:fs";
+import path from "node:path";
 import type Anthropic from "@anthropic-ai/sdk";
-import { LANGUAGES, type Language, type LoadedConfig } from "./config.js";
+import { LANGUAGES, type Language, type LoadedConfig, type ProjectConfig } from "./config.js";
 import type { GmailReader } from "./gmail/client.js";
 import { gmailLink } from "./gmail/links.js";
-import { isNoiseAttachment, type ParsedMessage } from "./gmail/parse.js";
+import { isNoiseAttachment, quotedRest, type ParsedMessage } from "./gmail/parse.js";
 import {
-  appendSection,
+  attachmentLine,
+  blockId,
+  insertSection,
   messageSection,
   newNote,
+  replaceAttachmentLine,
   replaceTaskLine,
   replaceTriageFailed,
   setTaskDone,
@@ -15,21 +20,30 @@ import {
   type AppKey,
 } from "./obsidian/note.js";
 import { cleanSubject, noteRelPath, type VaultWriter } from "./obsidian/writer.js";
-import { isOnlyCc, isOwner, gmailScopeQuery, matchContact, replyRoute } from "./scope.js";
-import { OPEN_STATUSES, triagedStatus, type FiledAttachment, type Item, type Status, type Store } from "./store/db.js";
+import { answers, isOnlyCc, isOwner, gmailScopeQuery, matchContact, needsReview, replyRoute, rulesFingerprint } from "./scope.js";
+import { OPEN_STATUSES, type FiledAttachment, type Item, type Status, type Store } from "./store/db.js";
 import { callClaude, finalize, TriageError, type Triage } from "./triage/claude.js";
 import { URGENCIES, type Urgency } from "./triage/schema.js";
 import { localIso, localStamp, log } from "./util/time.js";
 
 const LAST_SEEN_KEY = "gmail.lastSeenEpoch";
+const RULES_KEY = "rules.fingerprint";
 // Each poll re-reads the last week. Messages already seen are skipped by id, so this costs one
 // list call, and it catches mail that reaches the inbox late: rescued from spam, restored from
 // trash, or indexed slowly.
 const OVERLAP_SECONDS = 7 * 86_400;
+// Renamed or moved notes are looked for in at most this many Markdown files.
+const MAX_NOTES_SCANNED = 5_000;
 
 /** A reply of yours: sent, not a draft or a scheduled message. */
 function isSentReply(labelIds: string[]): boolean {
   return labelIds.includes("SENT") && !labelIds.includes("DRAFT") && !labelIds.includes("SCHEDULED");
+}
+
+/** Messages before msg in its thread; equal times are ordered by id, so two messages never quote each other. */
+function earlierThan(thread: ParsedMessage[], msg: ParsedMessage): ParsedMessage[] {
+  const t = msg.internalDate.getTime();
+  return thread.filter((m) => m.id !== msg.id && (m.internalDate.getTime() < t || (m.internalDate.getTime() === t && m.id < msg.id)));
 }
 
 export interface PollResult {
@@ -51,6 +65,15 @@ export class Pipeline {
 
   async pollOnce(): Promise<PollResult> {
     const result: PollResult = { matched: 0, ingested: 0, failed: 0, refiled: 0, closedByReply: 0 };
+
+    // Changed contact rules: mail skipped for having no rule is looked at again.
+    const fingerprint = rulesFingerprint(this.cfg);
+    if (this.store.getState(RULES_KEY) !== fingerprint) {
+      const n = this.store.forgetUnmatchedSkips();
+      if (n) log(`contact rules changed: ${n} skipped messages will be checked again`);
+      this.store.setState(RULES_KEY, fingerprint);
+    }
+
     const since = this.store.getState(LAST_SEEN_KEY);
     const query = gmailScopeQuery(this.cfg, since ? Number(since) - OVERLAP_SECONDS : undefined, this.cfg.gmail.initialLookbackDays);
     const listing = await this.gmail.listIds(query);
@@ -69,8 +92,9 @@ export class Pipeline {
       }
     }
     // Oldest first, so sections land in a thread note in the order they were sent.
-    messages.sort((a, b) => a.internalDate.getTime() - b.internalDate.getTime());
+    messages.sort((a, b) => a.internalDate.getTime() - b.internalDate.getTime() || a.id.localeCompare(b.id));
 
+    const nowSeconds = Math.floor(Date.now() / 1000);
     let newest = since ? Number(since) : 0;
     for (const msg of messages) {
       if (!msg.from.email) {
@@ -88,16 +112,20 @@ export class Pipeline {
       try {
         await this.ingest(msg);
         result.ingested++;
-        newest = Math.max(newest, Math.floor(msg.internalDate.getTime() / 1000));
+        // A message dated in the future never pushes the checkpoint past now.
+        newest = Math.max(newest, Math.min(Math.floor(msg.internalDate.getTime() / 1000), nowSeconds));
       } catch (err) {
         result.failed++;
         log(`ingest failed for ${msg.id}`, err);
         this.store.log(msg.id, "ingest_failed", err instanceof Error ? err.message : String(err));
       }
     }
-    if (newest) this.store.setState(LAST_SEEN_KEY, String(newest));
+    if (newest) this.store.setState(LAST_SEEN_KEY, String(Math.min(newest, nowSeconds)));
 
-    result.refiled = await this.refileUnfiled();
+    const refile = await this.refileUnfiled();
+    result.refiled = refile.done;
+    result.failed += refile.failed;
+    await this.retryAttachments();
     result.closedByReply = await this.closeAnswered();
     return result;
   }
@@ -117,19 +145,8 @@ export class Pipeline {
       threadIdIsMessageId: thread.some((m) => m.id === msg.threadId),
     });
     const onlyCc = isOnlyCc(cfg, msg.to.map((a) => a.email), msg.cc.map((a) => a.email));
-    const route = replyRoute(match, msg.from);
-    const receivedIso = localIso(msg.internalDate, cfg.tz);
-
-    const attachments: FiledAttachment[] = [];
-    for (const ref of msg.attachments.filter((a) => !isNoiseAttachment(a))) {
-      try {
-        const data = await this.gmail.attachment(msg.id, ref);
-        attachments.push(this.vault.saveAttachment(project.folder, receivedIso, ref.filename, data, project.id));
-      } catch (err) {
-        log(`attachment ${ref.filename} of ${msg.id} not saved`, err);
-        this.store.log(msg.id, "attachment_failed", `${ref.filename}: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
+    const route = replyRoute(match, msg.from, msg.replyTo);
+    const attachments = await this.saveAttachments(msg, project, localIso(msg.internalDate, cfg.tz));
 
     const now = new Date().toISOString();
     const item: Item = {
@@ -145,6 +162,7 @@ export class Pipeline {
       subject: msg.subject,
       receivedAt: msg.internalDate.toISOString(),
       body: msg.latestText,
+      fullText: msg.text,
       onlyCc,
       senderVerified: msg.senderVerified,
       replyToName: route.name,
@@ -168,58 +186,131 @@ export class Pipeline {
     await this.file(item, msg, thread);
   }
 
+  /** Saves a message's attachments; one that fails is recorded as not saved and retried later. */
+  private async saveAttachments(msg: ParsedMessage, project: ProjectConfig, receivedIso: string): Promise<FiledAttachment[]> {
+    const out: FiledAttachment[] = [];
+    const refs = msg.attachments.filter((a) => !isNoiseAttachment(a));
+    for (const [index, ref] of refs.entries()) {
+      try {
+        const data = await this.gmail.attachment(msg.id, ref);
+        out.push({ ...this.vault.saveAttachment(project.folder, receivedIso, ref.filename, data, project.id), saved: true, index });
+      } catch (err) {
+        log(`attachment ${ref.filename} of ${msg.id} not saved yet`, err);
+        this.store.log(msg.id, "attachment_failed", `${ref.filename}: ${err instanceof Error ? err.message : String(err)}`);
+        out.push({ filename: ref.filename, size: ref.size, path: "", inVault: false, saved: false, index });
+      }
+    }
+    return out;
+  }
+
   /** Triage (when still needed) and the note for one stored item. */
   private async file(item: Item, msg: ParsedMessage, thread: ParsedMessage[]): Promise<void> {
     const cfg = this.cfg;
     const project = cfg.projects.find((p) => p.id === item.projectId);
     if (!project) throw new Error(`project ${item.projectId} is no longer in the config`);
-    const earlier = thread.filter((m) => m.id !== msg.id && m.internalDate.getTime() <= msg.internalDate.getTime());
 
     let triage = item.triage;
     let triageError = item.triageError;
-    if (item.status === "pending_triage") ({ triage, triageError } = await this.runTriage(msg, earlier, item.onlyCc));
+    if (item.status === "pending_triage") ({ triage, triageError } = await this.runTriage(msg, earlierThan(thread, msg), item.onlyCc));
 
+    const stamp = localStamp(msg.internalDate, cfg.tz);
     const section = messageSection({
       itemId: item.id,
-      receivedLocal: localStamp(msg.internalDate, cfg.tz),
+      receivedLocal: stamp,
       fromName: item.fromName,
       fromEmail: item.fromEmail,
       senderVerified: item.senderVerified,
       link: item.link,
       onlyCc: item.onlyCc,
       body: item.body,
+      quoted: quotedRest(item.fullText, item.body),
       attachments: item.attachments,
       triage,
       triageError,
     });
-    const fm: Partial<Record<AppKey, string | boolean>> = {
+
+    // The note's identity (subject, sender, link) follows the newest message in the thread.
+    const siblings = this.store.threadItems(item.threadId, item.projectId).filter((i) => i.id !== item.id && i.notePath);
+    const isNewest = siblings.every((i) => i.receivedAt <= item.receivedAt);
+    const identity: Partial<Record<AppKey, string | boolean>> = {
       source: "gmail",
       project: project.name,
       subject: cleanSubject(item.subject),
       gmail: item.link,
       from: item.fromName ? `${item.fromName} <${item.fromEmail}>` : item.fromEmail,
-      review_required: triage?.review_required ?? (Boolean(matchContact(cfg, item.fromEmail)?.contact.reviewRequired) || item.senderVerified === false),
-      updated: localIso(new Date(), cfg.tz),
     };
 
-    const existing = this.store.threadNote(item.threadId);
-    let rel: string;
-    if (existing && this.vault.exists(existing)) {
-      rel = existing;
-      this.vault.write(rel, appendSection(updateFrontmatter(this.vault.read(rel), fm), section));
+    let rel = this.noteFor(item.threadId, item.projectId);
+    if (rel) {
+      const content = updateFrontmatter(this.vault.read(rel), isNewest ? identity : { project: project.name });
+      this.vault.write(rel, insertSection(content, section, stamp));
     } else {
       rel = this.vault.freeNotePath(noteRelPath(project.folder, localIso(msg.internalDate, cfg.tz), item.subject));
-      this.vault.write(rel, newNote(fm, cleanSubject(item.subject), section));
-      this.store.setThreadNote(item.threadId, project.id, rel);
+      this.vault.write(rel, newNote(identity, cleanSubject(item.subject), section));
     }
     this.store.setNotePath(item.id, rel);
-    this.syncNoteStatus(item.threadId);
+    this.store.setThreadNote(item.threadId, item.projectId, rel);
+    this.syncNoteStatus(item.threadId, item.projectId);
     log(`filed ${item.id} (${project.id}) ${triage ? `${triage.urgency} ${triage.urgency_score}` : "triage failed"}`);
   }
 
+  /**
+   * The thread's note in this matter, if it still exists. A note you renamed or moved in Obsidian is
+   * found again by its task markers, so the thread does not split into a second note.
+   */
+  private noteFor(threadId: string, projectId: string): string | null {
+    const stored = this.store.threadNote(threadId, projectId);
+    if (!stored) return null;
+    if (this.vault.exists(stored)) return stored;
+    const found = this.locateNote(threadId, projectId);
+    if (found) {
+      log(`note for thread ${threadId} moved to ${found}`);
+      this.store.setThreadNote(threadId, projectId, found);
+    }
+    return found;
+  }
+
+  private locateNote(threadId: string, projectId: string): string | null {
+    const markers = this.store.threadItems(threadId, projectId).flatMap((i) => [`^${blockId(i.id)}`, `^at-${blockId(i.id).slice(3)}-`]);
+    if (!markers.length) return null;
+    const project = this.cfg.projects.find((p) => p.id === projectId);
+    const roots = [project ? path.join(this.vault.vaultPath, project.folder) : null, this.vault.vaultPath].filter((r): r is string => Boolean(r));
+    let scanned = 0;
+    const seen = new Set<string>();
+    for (const root of roots) {
+      const stack = [root];
+      while (stack.length && scanned < MAX_NOTES_SCANNED) {
+        const dir = stack.pop()!;
+        let entries: fs.Dirent[];
+        try {
+          entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const e of entries) {
+          if (e.name.startsWith(".")) continue;
+          const full = path.join(dir, e.name);
+          if (e.isDirectory()) stack.push(full);
+          else if (e.name.endsWith(".md") && !seen.has(full)) {
+            seen.add(full);
+            scanned++;
+            try {
+              const text = fs.readFileSync(full, "utf8");
+              if (markers.some((m) => text.includes(m))) return path.relative(this.vault.vaultPath, full).split(path.sep).join("/");
+            } catch {
+              // unreadable file: skip
+            }
+          }
+        }
+      }
+    }
+    return null;
+  }
+
   /** Finishes items stored without a note: a failed vault write, or a stop in the middle of triage. */
-  private async refileUnfiled(): Promise<number> {
+  private async refileUnfiled(): Promise<{ done: number; failed: number }> {
     let done = 0;
+    let failed = 0;
     for (const item of this.store.unfiled()) {
       try {
         const msg = await this.gmail.message(item.id);
@@ -227,10 +318,45 @@ export class Pipeline {
         await this.file(item, msg, thread);
         done++;
       } catch (err) {
+        failed++;
         log(`could not file ${item.id} yet`, err);
+        this.store.log(item.id, "file_failed", err instanceof Error ? err.message : String(err));
       }
     }
-    return done;
+    return { done, failed };
+  }
+
+  /** Tries again to save attachments that failed to download, and updates their lines in the note. */
+  private async retryAttachments(): Promise<void> {
+    for (const item of this.store.withUnsavedAttachments()) {
+      const project = this.cfg.projects.find((p) => p.id === item.projectId);
+      if (!project) continue;
+      let msg: ParsedMessage;
+      try {
+        msg = await this.gmail.message(item.id);
+      } catch {
+        continue;
+      }
+      const refs = msg.attachments.filter((a) => !isNoiseAttachment(a));
+      const updated = [...item.attachments];
+      let changed = false;
+      for (const [i, a] of updated.entries()) {
+        if (a.saved !== false) continue;
+        const ref = refs[a.index ?? -1];
+        if (!ref || ref.filename !== a.filename) continue;
+        try {
+          const data = await this.gmail.attachment(item.id, ref);
+          updated[i] = { ...this.vault.saveAttachment(project.folder, localIso(new Date(item.receivedAt), this.cfg.tz), ref.filename, data, project.id), saved: true, index: a.index };
+          changed = true;
+          if (item.notePath && this.vault.exists(item.notePath)) {
+            this.vault.write(item.notePath, replaceAttachmentLine(this.vault.read(item.notePath), item.id, a.index ?? 0, attachmentLine(item.id, updated[i]!)));
+          }
+        } catch (err) {
+          log(`attachment ${a.filename} of ${item.id} still not saved`, err);
+        }
+      }
+      if (changed) this.store.setAttachments(item.id, updated);
+    }
   }
 
   /** Calls Claude and applies the fixed rules; stores the result or the error. */
@@ -239,7 +365,7 @@ export class Pipeline {
     const match = matchContact(cfg, msg.from.email);
     if (!match) throw new Error(`no contact rule for ${msg.from.email}`);
     const { project, contact } = match;
-    const route = replyRoute(match, msg.from);
+    const route = replyRoute(match, msg.from, msg.replyTo);
     try {
       const { result, model } = await callClaude(this.claude, cfg, {
         ownerName: cfg.owner.name,
@@ -247,7 +373,7 @@ export class Pipeline {
         tz: cfg.tz,
         projectName: project.name,
         role: contact.role,
-        reviewRequired: contact.reviewRequired,
+        reviewRequired: needsReview(contact),
         onlyCc,
         senderVerified: msg.senderVerified,
         route,
@@ -259,11 +385,12 @@ export class Pipeline {
       const lang: Language =
         route.language ?? ((LANGUAGES as readonly string[]).includes(result.message_language) ? (result.message_language as Language) : "en");
       const triage = finalize(result, {
-        reviewRequired: contact.reviewRequired,
+        reviewRequired: needsReview(contact),
         alwaysUrgent: contact.alwaysUrgent,
         signOff: cfg.signOffs[lang],
         model,
         senderVerified: msg.senderVerified,
+        tz: cfg.tz,
       });
       this.store.saveTriage(msg.id, triage);
       return { triage, triageError: "" };
@@ -281,20 +408,23 @@ export class Pipeline {
     if (item.status !== "triage_failed" && item.status !== "pending_triage") return item;
     const msg = await this.gmail.message(id);
     const thread = await this.gmail.thread(msg.threadId);
-    const earlier = thread.filter((m) => m.id !== msg.id && m.internalDate.getTime() <= msg.internalDate.getTime());
-    const { triage } = await this.runTriage(msg, earlier, item.onlyCc);
-    if (triage && item.notePath && this.vault.exists(item.notePath)) {
-      let content = this.vault.read(item.notePath);
+    const { triage } = await this.runTriage(msg, earlierThan(thread, msg), item.onlyCc);
+    const notePath = triage ? this.noteFor(item.threadId, item.projectId) : null;
+    if (triage && notePath) {
+      let content = this.vault.read(notePath);
       content = replaceTriageFailed(content, id, triage);
       content = replaceTaskLine(content, id, taskLine(id, triage));
-      content = updateFrontmatter(content, { review_required: triage.review_required, updated: localIso(new Date(), this.cfg.tz) });
-      this.vault.write(item.notePath, content);
-      this.syncNoteStatus(item.threadId);
+      this.vault.write(notePath, content);
+      this.syncNoteStatus(item.threadId, item.projectId);
     }
     return this.store.get(id);
   }
 
-  /** Open items whose thread has a later sent message of yours were answered elsewhere (Gmail, Superhuman). */
+  /**
+   * Open items answered elsewhere (Gmail, Superhuman): a later sent message of yours in the thread,
+   * addressed to the sender, the reply address or the sender's domain. A forward to someone else
+   * does not count.
+   */
   private async closeAnswered(): Promise<number> {
     let closed = 0;
     for (const threadId of this.store.openThreadIds()) {
@@ -305,12 +435,12 @@ export class Pipeline {
         log(`could not check thread ${threadId}`, err);
         continue;
       }
-      const sentTimes = meta.filter((m) => isSentReply(m.labelIds)).map((m) => m.internalDate.getTime());
+      const sent = meta.filter((m) => isSentReply(m.labelIds));
       for (const item of this.store.openInThread(threadId)) {
         // A reply closes what asked for a reply; a task without a reply (needs_action) waits for you.
         if (item.status === "pending_triage" || item.status === "needs_action") continue;
         const after = Math.max(new Date(item.receivedAt).getTime(), item.reopenedAt ? new Date(item.reopenedAt).getTime() : 0);
-        if (sentTimes.some((t) => t > after)) {
+        if (sent.some((m) => m.internalDate.getTime() > after && answers(m.recipients, item))) {
           this.setStatus(item.id, "replied", "reply found in Gmail");
           closed++;
         }
@@ -326,10 +456,12 @@ export class Pipeline {
     if (status === "needs_reply" && !OPEN_STATUSES.includes(before.status)) this.store.reopen(id);
     else this.store.setStatus(id, status, reason);
     const item = this.store.get(id);
-    if (!item?.notePath || !this.vault.exists(item.notePath)) return item;
+    if (!item) return null;
+    const notePath = this.noteFor(item.threadId, item.projectId);
+    if (!notePath) return item;
     try {
-      this.vault.write(item.notePath, setTaskDone(this.vault.read(item.notePath), id, !OPEN_STATUSES.includes(item.status)));
-      this.syncNoteStatus(item.threadId);
+      this.vault.write(notePath, setTaskDone(this.vault.read(notePath), id, !OPEN_STATUSES.includes(item.status)));
+      this.syncNoteStatus(item.threadId, item.projectId);
     } catch (err) {
       log(`could not update note for ${id}`, err);
     }
@@ -340,17 +472,17 @@ export class Pipeline {
   setUserUrgency(id: string, urgency: Urgency | null): void {
     this.store.setUserUrgency(id, urgency);
     const item = this.store.get(id);
-    if (item) this.syncNoteStatus(item.threadId);
+    if (item) this.syncNoteStatus(item.threadId, item.projectId);
   }
 
   /**
-   * One note holds a whole thread, so its status, urgency and dates describe the thread: the most
-   * urgent open item if any is open, otherwise the latest item.
+   * One note holds a thread within one matter, so its status, urgency, dates and review flag
+   * describe the thread: the most urgent open item if any is open, otherwise the latest item.
    */
-  private syncNoteStatus(threadId: string): void {
-    const items = this.store.threadItems(threadId);
-    const notePath = this.store.threadNote(threadId);
-    if (!items.length || !notePath || !this.vault.exists(notePath)) return;
+  private syncNoteStatus(threadId: string, projectId: string): void {
+    const items = this.store.threadItems(threadId, projectId);
+    const notePath = this.noteFor(threadId, projectId);
+    if (!items.length || !notePath) return;
     const open = items.filter((i) => OPEN_STATUSES.includes(i.status));
     const urgencyOf = (i: Item) => i.userUrgency ?? i.triage?.urgency;
     const rank = (i: Item) => {
@@ -358,12 +490,14 @@ export class Pipeline {
       return u ? URGENCIES.indexOf(u) : URGENCIES.length;
     };
     const lead = open.length ? [...open].sort((a, b) => rank(a) - rank(b))[0]! : items[items.length - 1]!;
+    const contact = matchContact(this.cfg, lead.fromEmail)?.contact;
     try {
       const content = updateFrontmatter(this.vault.read(notePath), {
         status: lead.status,
         urgency: urgencyOf(lead) ?? "",
         reply_by: lead.triage?.reply_by ?? "",
         due: lead.triage?.due_date ?? "",
+        review_required: lead.triage?.review_required ?? (Boolean(contact && needsReview(contact)) || lead.senderVerified === false),
         updated: localIso(new Date(), this.cfg.tz),
       });
       this.vault.write(notePath, content);

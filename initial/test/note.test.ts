@@ -41,6 +41,7 @@ test("a section quotes the message and lists attachments", () => {
     link: "https://mail.google.com/x",
     onlyCc: true,
     body: "Line one\n\nLine two",
+    quoted: "",
     attachments: [
       { filename: "Draft.pdf", size: 1000, path: "Projects/X/attachments/2026-10-23 Draft.pdf", inVault: true },
       { filename: "Big.pdf", size: 18_000_000, path: "/data/large/Big.pdf", inVault: false },

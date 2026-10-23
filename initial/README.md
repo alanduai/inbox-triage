@@ -2,7 +2,7 @@
 
 Reads new Gmail from the people in your two private matters, triages each message with Claude, files it into your Obsidian vault, and shows a dashboard with a suggested reply you can edit. It runs on the Mac mini.
 
-**Phase 1 sends nothing.** Gmail access is read-only. To answer, copy the reply from the dashboard and send it from Gmail or Superhuman. The item closes on its own once your sent reply shows up in Gmail; a draft you are still writing does not close it.
+**Phase 1 sends nothing.** Gmail access is read-only. To answer, copy the reply from the dashboard and send it from Gmail or Superhuman. The item closes on its own once your sent reply to the sender (or to your lawyer, for court mail) shows up in Gmail. A draft you are still writing, or a forward to someone else, does not close it.
 
 | Phase | Adds |
 |---|---|
@@ -15,7 +15,7 @@ Reads new Gmail from the people in your two private matters, triages each messag
 
 1. Every minute the service asks Gmail for new mail from the senders listed in `config.json`. Each check looks back a week, so mail that reaches the inbox late (rescued from spam, restored from trash) is still found. It searches all mail, so messages Superhuman auto-archived are found too. Your own mail and Superhuman's reminder emails are ignored.
 2. Rules in the config decide the matter, the sender's role (your lawyer, the court, the other side, bank, advisor) and whether replies need review. Gmail's own sender check (DMARC, DKIM, SPF) is read too: mail that fails it is marked **Unverified sender**, because the From address may be forged.
-3. Claude (`claude-opus-5-5`) reads the message and up to six earlier messages in its thread. It returns:
+3. Claude (`claude-opus-5-5`) reads the message, any text it quotes or forwards (for example a court decision your lawyer forwarded), and up to six earlier messages in its thread. It returns:
    - a title, a summary, the urgency and the reason for it, the task, the due date and a reply-by time;
    - a suggested reply in the sender's language (English, Croatian or Swedish), ending with your sign-off;
    - a short acknowledgement.
@@ -25,7 +25,7 @@ Reads new Gmail from the people in your two private matters, triages each messag
    - Mail from the court or the other side is always answered through your own lawyer: the draft is written to her, whether you are in To or only in cc.
    - An unverified sender gets no acknowledgement and is never raised to urgent.
    - Facts only you know are left as `[brackets]`.
-5. The message is filed in the vault. Attachments are saved in the matter's `attachments/` folder, except files over your Obsidian Sync limit, which stay in `data/large-attachments/` and are linked from the note.
+5. The message is filed in the vault. Quoted or forwarded text sits folded under the new part. Attachments are saved in the matter's `attachments/` folder, except files over your Obsidian Sync limit, which stay in `data/large-attachments/` and are linked from the note. An attachment that fails to download is listed as "not saved yet" and retried on later checks.
 6. The dashboard lists open items, urgent first.
    - A message that needs a reply shows as **Needs reply**. One that needs something done but no reply (for example, upload documents to a portal) shows as **Action needed**; press **Mark done** when it's finished.
    - Rate each urgent item's urgency: **Yes**, or the level it should have been. Your rating replaces Claude's in the queue and in the note.
@@ -33,7 +33,7 @@ Reads new Gmail from the people in your two private matters, triages each messag
 
 ### The notes
 
-There is one note per email thread, for example `Projects/Sweden legal matter/2026-10-23 Draft statement.md`. A new message in the same thread is added to the end of that note.
+There is one note per email thread in each matter, for example `Projects/Sweden legal matter/2026-10-23 Draft statement.md`. A new message in the same thread is added in date order. You can rename or move a note in Obsidian; the app finds it again. Times are in the Mac mini's time zone, and the dashboard shows them in that zone even from a laptop set to another one.
 
 The app changes only three things in a note:
 - these frontmatter keys: `source`, `project`, `subject`, `gmail`, `from`, `status`, `urgency`, `reply_by`, `due`, `review_required`, `updated`;
@@ -59,7 +59,7 @@ npm run init          # creates config.json and the private data/ folder
 - `vault.path`: the folder of vault B, the one that contains `.obsidian/`.
 - `vault.syncEncryption`: in Obsidian, open **Settings → Sync** and check whether the remote vault uses end-to-end or standard encryption, then write `"end-to-end"` or `"standard"`. Everything syncs either way; the dashboard and `npm run doctor` show which one you have.
 - `vault.maxSyncFileMB`: 200 for Obsidian Sync Plus, 5 for Standard.
-- `projects`: the real addresses and domains for each matter. An exact address beats a domain rule.
+- `projects`: the real addresses and domains for each matter, written as `name@firm.se` or `@firm.se` (a domain needs the `@`). An exact address beats a domain rule. A sender may appear in only one matter. A matter with court or other-side contacts must name your own lawyer in `counsel`. When you add a rule, mail that was skipped for having none is checked again.
   - Give the court and the other side's law firm `"reviewRequired": true`.
   - Give your lawyer, the court and your bank contact `"alwaysUrgent": true`.
   - Set `counsel` to your own lawyer in the Swedish matter, so drafts answering the court or the other side are addressed to her.

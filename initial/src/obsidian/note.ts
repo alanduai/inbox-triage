@@ -31,14 +31,24 @@ export function singleLine(text: string): string {
 }
 
 /**
- * Makes email text inert in Obsidian: no images or links ([ ]), no HTML (<), no code or Dataview
- * (`), no tags (#), no comments (%), no escapes (\). It still reads as the same text.
+ * Makes email text inert and faithful in Obsidian: it renders as exactly the characters sent.
+ * Inline: no links or images ([ ]), HTML or entities (< &), code or Dataview (`), tags (#),
+ * comments (%), emphasis (* _ ~ =), maths ($) or tables (|). At the start of a line: no
+ * numbered or bulleted list ("30. 10. 2026." stays a date), quote (>) or heading underline.
  */
 export function escapeMd(text: string): string {
   return text
-    .replace(/\\/g, "\\\\")
-    .replace(/[`\[\]#%]/g, (c) => `\\${c}`)
-    .replace(/</g, "&lt;");
+    .split("\n")
+    .map((line) =>
+      line
+        .replace(/\\/g, "\\\\")
+        .replace(/[`\[\]#%*_~=$|]/g, (c) => `\\${c}`)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/^(\s*)(\d{1,9})([.)])/, "$1$2\\$3")
+        .replace(/^(\s*)([-+>])/, "$1\\$2"),
+    )
+    .join("\n");
 }
 
 export function blockId(itemId: string): string {
@@ -124,6 +134,40 @@ export function replaceTriageFailed(content: string, itemId: string, triage: Tri
   return content;
 }
 
+/** The app's line for one attachment; an unsaved one carries a block id so a later retry can replace it. */
+export function attachmentLine(itemId: string, a: FiledAttachment): string {
+  const label = singleLine(a.filename).replace(/[[\]|#^]/g, " ").trim() || "attachment";
+  if (a.saved === false) {
+    return `- ${escapeMd(label)} (${sizeLabel(a.size)}): not saved yet, it is retried; open the message in Gmail meanwhile ^at-${blockId(itemId).slice(3)}-${a.index ?? 0}`;
+  }
+  return a.inVault
+    ? `- [[${a.path}|${label}]]`
+    : `- ${escapeMd(label)} (${sizeLabel(a.size)}, over the Obsidian Sync file limit; kept on the Mac mini at ${escapeMd(a.path)})`;
+}
+
+/** Swaps the "not saved yet" line of an attachment for its saved line. */
+export function replaceAttachmentLine(content: string, itemId: string, index: number, line: string): string {
+  const re = new RegExp(`^- .*\\^at-${blockId(itemId).slice(3)}-${index}\\s*$`, "m");
+  return content.replace(re, line);
+}
+
+const HEADING_STAMP = /^## (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) /;
+
+/**
+ * Adds a message section in date order: before the first later section, else at the end. Your own
+ * text between sections stays where it is.
+ */
+export function insertSection(content: string, section: string, stamp: string): string {
+  const lines = content.split("\n");
+  const at = lines.findIndex((l) => {
+    const m = l.match(HEADING_STAMP);
+    return m !== null && m[1]! > stamp;
+  });
+  if (at === -1) return appendSection(content, section);
+  const block = section.endsWith("\n") ? section : `${section}\n`;
+  return [...lines.slice(0, at), ...block.split("\n"), ...lines.slice(at)].join("\n");
+}
+
 export interface SectionInput {
   itemId: string;
   receivedLocal: string;
@@ -134,6 +178,8 @@ export interface SectionInput {
   link: string;
   onlyCc: boolean;
   body: string;
+  // Quoted or forwarded text after the new part; shown folded under it.
+  quoted: string;
   attachments: FiledAttachment[];
   triage: Triage | null;
   triageError: string;
@@ -157,6 +203,7 @@ export function messageSection(s: SectionInput): string {
   if (s.triage?.review_required) flags.push("review required");
   const who = escapeMd(singleLine(s.fromName ? `${s.fromName} (${s.fromEmail})` : s.fromEmail));
   const lines = [`## ${s.receivedLocal} · ${who}`, flags.join(" · "), "", quote(escapeMd(s.body)), ""];
+  if (s.quoted) lines.push("> [!quote]- Quoted or forwarded text", quote(escapeMd(s.quoted)), "");
 
   if (s.triage) {
     lines.push(...triageLines(s.triage), "");
@@ -166,14 +213,7 @@ export function messageSection(s: SectionInput): string {
 
   if (s.attachments.length) {
     lines.push("**Attachments:**");
-    for (const a of s.attachments) {
-      const label = singleLine(a.filename).replace(/[[\]|#^]/g, " ").trim() || "attachment";
-      lines.push(
-        a.inVault
-          ? `- [[${a.path}|${label}]]`
-          : `- ${escapeMd(label)} (${sizeLabel(a.size)}, over the Obsidian Sync file limit; kept on the Mac mini at ${escapeMd(a.path)})`,
-      );
-    }
+    for (const a of s.attachments) lines.push(attachmentLine(s.itemId, a));
     lines.push("");
   }
 

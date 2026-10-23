@@ -243,59 +243,102 @@ function codePoint(n: number): string {
   return Number.isInteger(n) && n > 0 && n <= 0x10ffff && !(n >= 0xd800 && n <= 0xdfff) ? String.fromCodePoint(n) : "\ufffd";
 }
 
+// Latin-1 names (U+00A0 to U+00FF, in order) and the others that appear in Croatian, Swedish and business mail.
+const LATIN1 =
+  "nbsp iexcl cent pound curren yen brvbar sect uml copy ordf laquo not shy reg macr deg plusmn sup2 sup3 acute micro para middot cedil sup1 ordm raquo frac14 frac12 frac34 iquest Agrave Aacute Acirc Atilde Auml Aring AElig Ccedil Egrave Eacute Ecirc Euml Igrave Iacute Icirc Iuml ETH Ntilde Ograve Oacute Ocirc Otilde Ouml times Oslash Ugrave Uacute Ucirc Uuml Yacute THORN szlig agrave aacute acirc atilde auml aring aelig ccedil egrave eacute ecirc euml igrave iacute icirc iuml eth ntilde ograve oacute ocirc otilde ouml divide oslash ugrave uacute ucirc uuml yacute thorn yuml".split(" ");
+const ENTITIES: Record<string, number> = {
+  ...Object.fromEntries(LATIN1.map((name, i) => [name, 0xa0 + i])),
+  quot: 34, amp: 38, apos: 39, lt: 60, gt: 62,
+  Cacute: 0x106, cacute: 0x107, Ccaron: 0x10c, ccaron: 0x10d, Dstrok: 0x110, dstrok: 0x111,
+  OElig: 0x152, oelig: 0x153, Scaron: 0x160, scaron: 0x161, Yuml: 0x178, Zcaron: 0x17d, zcaron: 0x17e,
+  fnof: 0x192, circ: 0x2c6, tilde: 0x2dc, ensp: 0x2002, emsp: 0x2003, thinsp: 0x2009, zwnj: 0x200c, zwj: 0x200d,
+  lrm: 0x200e, rlm: 0x200f, ndash: 0x2013, mdash: 0x2014, lsquo: 0x2018, rsquo: 0x2019, sbquo: 0x201a,
+  ldquo: 0x201c, rdquo: 0x201d, bdquo: 0x201e, dagger: 0x2020, Dagger: 0x2021, bull: 0x2022, hellip: 0x2026,
+  permil: 0x2030, prime: 0x2032, Prime: 0x2033, lsaquo: 0x2039, rsaquo: 0x203a, euro: 0x20ac, trade: 0x2122,
+  larr: 0x2190, rarr: 0x2192, minus: 0x2212,
+};
+
+/** Decodes character references in one pass, so "&amp;lt;" stays "&lt;". Unknown names are kept as written. */
+export function decodeEntities(s: string): string {
+  return s.replace(/&(#\d{1,8}|#x[0-9a-f]{1,8}|[a-z][a-z0-9]{1,31});/gi, (whole, ref: string) => {
+    if (ref[0] === "#") return codePoint(ref[1] === "x" || ref[1] === "X" ? parseInt(ref.slice(2), 16) : Number(ref.slice(1)));
+    const cp = ENTITIES[ref];
+    return cp === undefined ? whole : String.fromCodePoint(cp);
+  });
+}
+
 export function htmlToText(html: string): string {
-  let s = dropBlocks(html.slice(0, MAX_HTML_CHARS))
+  const s = dropBlocks(html.slice(0, MAX_HTML_CHARS))
     .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/(p|div|tr|h[1-6]|blockquote|table)>/gi, "\n")
+    .replace(/<hr\b[^<>]*>/gi, "\n")
+    .replace(/<\/(p|div|tr|h[1-6]|blockquote|table|ul|ol)>/gi, "\n")
+    .replace(/<\/t[dh]>/gi, "\t")
     .replace(/<li\b[^<>]*>/gi, "\n- ")
     .replace(/<[^<>]*>/g, "");
-  s = s
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&#(\d{1,8});/g, (_m, d: string) => codePoint(Number(d)))
-    .replace(/&#x([0-9a-f]{1,8});/gi, (_m, h: string) => codePoint(parseInt(h, 16)))
-    .replace(/&amp;/gi, "&");
-  return s
+  return decodeEntities(s)
     .split("\n")
-    .map((l) => l.replace(/[ \t]+/g, " ").trimEnd())
+    .map((l) => l.replace(/[ \t\u00a0]+/g, " ").trim())
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
-const QUOTE_HEADERS: RegExp[] = [
-  /^On .{1,240}wrote:\s*$/,
-  /^Den .{1,240}skrev.{0,60}:\s*$/,
-  /^.{0,240}\b(je )?(napisao|napisala|napisao\/la)\b.{0,60}:\s*$/,
-  /^-{2,}\s*(Original Message|Ursprungligt meddelande|Originalmeddelande|Izvorna poruka|Izvorni e-mail)\s*-{2,}/i,
-  /^_{10,}\s*$/,
+// A forward carries the content that matters, so it is never cut.
+const FORWARD_MARKERS: RegExp[] = [
+  /^-{3,}\s*(Forwarded message|Vidarebefordrat meddelande|Proslije[dđ]ena poruka|Prosle[dđ]ena poruka|Weitergeleitete Nachricht)\s*-{3,}$/i,
+  /^(Begin forwarded message|Vidarebefordrat meddelande|Proslije[dđ]ena poruka|Prosle[dđ]ena poruka):?$/i,
 ];
-const OUTLOOK_FROM = /^(From|Från|Šalje|Od|Pošiljatelj):\s/;
-const OUTLOOK_NEXT = /^(Sent|Skickat|Poslano|Datum|Date|Šalje|Poslan):\s/;
+const FORWARD_SUBJECT = /^\s*(fwd?|vb|wg|tr)\s*(\[\d+\])?\s*:/i;
+// Gmail and Apple Mail attribution lines in English, Swedish and Croatian. They only count with an
+// address in them or a ">" quote right after, so an ordinary sentence ending in "wrote:" is kept.
+const ATTRIBUTIONS: RegExp[] = [/^On\b.{1,240}\bwrote:$/, /^Den\b.{1,240}\bskrev\b.{0,120}:$/, /^.{1,240}\b(napisao|napisala)( je)?:$/];
+const ORIGINAL_MARKER = /^-{2,}\s*(Original Message|Ursprungligt meddelande|Originalmeddelande|Izvorna poruka|Izvorni e-mail)\s*-{2,}$/i;
+const HEADER_FROM = /^(From|Från|Šalje|Od|Pošiljatelj|Pošiljalac):\s/i;
+const HEADER_SENT = /^(Sent|Skickat|Poslano|Datum|Date|Poslan):\s/i;
+const HEADER_SUBJECT = /^(Subject|Ämne|Predmet|Tema):\s/i;
+const HAS_ADDRESS = /[^\s<>"(),;:]+@[^\s<>"(),;:]+\.[a-z]{2,}/i;
 
-/** Drops quoted earlier messages so the note shows what is new. Keeps everything if nothing is left. */
-export function stripQuoted(text: string): string {
+/**
+ * The part of a message that is new: drops a quoted earlier message at the end. Keeps the whole
+ * text for forwards, for inline answers under a quote, and whenever the cut is not certain. The
+ * full text is kept separately and still reaches Claude and the note.
+ */
+export function stripQuoted(text: string, subject = ""): string {
+  const full = text.trim();
+  if (FORWARD_SUBJECT.test(subject)) return full;
   const lines = text.split("\n");
-  let cut = lines.length;
-  for (let i = 0; i < lines.length; i++) {
-    const line = (lines[i] ?? "").trim();
-    if (QUOTE_HEADERS.some((r) => r.test(line))) {
+  const trimmed = lines.map((l) => l.trim());
+  if (trimmed.some((l) => FORWARD_MARKERS.some((r) => r.test(l)))) return full;
+
+  let cut = -1;
+  for (let i = 0; i < trimmed.length && cut === -1; i++) {
+    const line = trimmed[i] ?? "";
+    if (ORIGINAL_MARKER.test(line)) cut = i;
+    else if (ATTRIBUTIONS.some((r) => r.test(line))) {
+      const after = trimmed.slice(i + 1).filter(Boolean);
+      const quoted = after.filter((l) => l.startsWith(">")).length;
+      if (!HAS_ADDRESS.test(line) && !(after[0] ?? "").startsWith(">")) continue;
+      // Answers written between quoted lines: the whole text is the message.
+      if (quoted > 0 && quoted < after.length) return full;
       cut = i;
-      break;
-    }
-    if (OUTLOOK_FROM.test(line) && lines.slice(i + 1, i + 5).some((l) => OUTLOOK_NEXT.test(l.trim()))) {
-      cut = i;
-      break;
+    } else if (HEADER_FROM.test(line)) {
+      const block = trimmed.slice(i + 1, i + 7);
+      if (block.some((l) => HEADER_SENT.test(l)) && block.some((l) => HEADER_SUBJECT.test(l))) {
+        cut = i > 0 && /^_{10,}$/.test(trimmed[i - 1] ?? "") ? i - 1 : i;
+      }
     }
   }
-  let kept = lines.slice(0, cut);
-  // Trailing "> " quote blocks.
+  if (cut === -1) return full;
+  const kept = lines.slice(0, cut);
   while (kept.length && /^\s*(>|$)/.test(kept[kept.length - 1] ?? "")) kept.pop();
-  const result = kept.join("\n").trim();
-  return result || text.trim();
+  return kept.join("\n").trim() || full;
+}
+
+/** What stripQuoted left out: the quoted or forwarded rest of the message. */
+export function quotedRest(text: string, latest: string): string {
+  const full = text.trim();
+  if (!latest || latest === full) return "";
+  return full.startsWith(latest) ? full.slice(latest.length).trim() : full;
 }
 
 export function parseMessage(msg: gmail_v1.Schema$Message): ParsedMessage {
@@ -347,7 +390,7 @@ export function parseMessage(msg: gmail_v1.Schema$Message): ParsedMessage {
     subject: header(headers, "Subject") || "(no subject)",
     rfc822MessageId: header(headers, "Message-ID"),
     text,
-    latestText: stripQuoted(text),
+    latestText: stripQuoted(text, header(headers, "Subject")),
     attachments,
     senderVerified: senderVerified(headers, from.email),
     deferredBody,
@@ -357,7 +400,9 @@ export function parseMessage(msg: gmail_v1.Schema$Message): ParsedMessage {
 }
 
 function bodyText(plain: string[], html: string[]): string {
-  return (plain.length ? plain.join("\n\n") : htmlToText(html.join("\n\n"))).replace(/\r\n/g, "\n").trim();
+  const p = plain.join("\n\n").replace(/\r\n?/g, "\n").trim();
+  // A blank text part next to real HTML (some mail clients send one) must not hide the HTML.
+  return p || htmlToText(html.join("\n\n")).replace(/\r\n?/g, "\n").trim();
 }
 
 /** Adds body parts that Gmail served by attachment id (large messages) and recomputes the text. */
@@ -366,7 +411,7 @@ export function completeBody(msg: ParsedMessage, fetched: { mimeType: string; da
   const html = [...msg.htmlParts];
   for (const f of fetched) (f.mimeType === "text/plain" ? plain : html).push(decodeBytes(f.data, f.charset));
   const text = bodyText(plain, html);
-  return { ...msg, text, latestText: stripQuoted(text), deferredBody: [], plainParts: plain, htmlParts: html };
+  return { ...msg, text, latestText: stripQuoted(text, msg.subject), deferredBody: [], plainParts: plain, htmlParts: html };
 }
 
 /** Logos and signature images: inline images under 50 KB are not worth filing. */

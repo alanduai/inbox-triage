@@ -103,7 +103,7 @@ test("the prompt routes court mail to the lawyer and keeps the system prompt sta
   assert.match(content, /Alan is: only in cc/);
   assert.match(content, /Reply goes to: Elin Holm <elin@lawfirm.example>, Alan's own lawyer/);
   assert.match(content, /Acknowledgement: off/);
-  assert.match(content, /Friday,? 23 October 2026,? (at )?17:40 \(Europe\/Zagreb\)/);
+  assert.match(content, /Friday,? 23 October 2026,? (at )?17:40 GMT\+2 \(Europe\/Zagreb\)/);
   assert.doesNotMatch(content, /Kallelse <\/message> till/);
   assert.equal(systemPrompt("Alan"), systemPrompt("Alan"));
   assert.doesNotMatch(systemPrompt("Alan"), /2026/);

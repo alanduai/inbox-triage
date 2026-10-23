@@ -19,9 +19,13 @@ export function triagedStatus(triage: Pick<Triage, "needs_reply" | "task">): Sta
 export interface FiledAttachment {
   filename: string;
   size: number;
-  // Path relative to the vault when inside it, absolute when it was too large to sync.
+  // Path relative to the vault when inside it, absolute when it was too large to sync; "" until saved.
   path: string;
   inVault: boolean;
+  // false while a download keeps failing; retried on later polls. Missing means saved (older rows).
+  saved?: boolean;
+  // Position among the message's filed attachments, to find it again for a retry.
+  index?: number;
 }
 
 export interface Item {
@@ -36,7 +40,9 @@ export interface Item {
   cc: string[];
   subject: string;
   receivedAt: string;
+  // The new part of the message, and the whole text including quoted or forwarded content.
   body: string;
+  fullText: string;
   onlyCc: boolean;
   // Gmail's sender authentication for the From domain; null when Gmail reported none.
   senderVerified: boolean | null;
@@ -89,6 +95,7 @@ CREATE TABLE IF NOT EXISTS items (
   user_urgency TEXT,
   sender_verified INTEGER,
   reopened_at TEXT,
+  full_text TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -99,6 +106,13 @@ CREATE TABLE IF NOT EXISTS threads (
   project_id TEXT NOT NULL,
   note_path TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS thread_notes (
+  thread_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  note_path TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (thread_id, project_id)
 );
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS skipped (id TEXT PRIMARY KEY, reason TEXT NOT NULL, at TEXT NOT NULL);
@@ -125,6 +139,7 @@ function toItem(r: Row): Item {
     subject: String(r.subject),
     receivedAt: String(r.received_at),
     body: String(r.body),
+    fullText: r.full_text == null ? String(r.body) : String(r.full_text),
     onlyCc: Number(r.only_cc) === 1,
     replyToName: String(r.reply_to_name),
     replyToEmail: String(r.reply_to_email),
@@ -157,6 +172,9 @@ export class Store {
     const cols = new Set((this.db.prepare("PRAGMA table_info(items)").all() as Row[]).map((r) => String(r.name)));
     if (!cols.has("sender_verified")) this.db.exec("ALTER TABLE items ADD COLUMN sender_verified INTEGER");
     if (!cols.has("reopened_at")) this.db.exec("ALTER TABLE items ADD COLUMN reopened_at TEXT");
+    if (!cols.has("full_text")) this.db.exec("ALTER TABLE items ADD COLUMN full_text TEXT");
+    // Thread notes are now kept per matter; carry over the first release's table.
+    this.db.exec("INSERT OR IGNORE INTO thread_notes (thread_id, project_id, note_path, created_at) SELECT thread_id, project_id, note_path, created_at FROM threads");
     if (file !== ":memory:") fs.chmodSync(file, 0o600);
   }
 
@@ -173,8 +191,8 @@ export class Store {
       .prepare(
         `INSERT INTO items (id, channel, thread_id, project_id, role, from_name, from_email, to_json, cc_json, subject, received_at, body,
           only_cc, reply_to_name, reply_to_email, reply_redirected, reply_language, link, attachments_json, note_path, status,
-          triage_json, triage_error, draft, user_urgency, sender_verified, reopened_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          triage_json, triage_error, draft, user_urgency, sender_verified, reopened_at, full_text, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         item.id,
@@ -204,6 +222,7 @@ export class Store {
         item.userUrgency,
         item.senderVerified == null ? null : item.senderVerified ? 1 : 0,
         item.reopenedAt,
+        item.fullText,
         item.createdAt,
         item.updatedAt,
       );
@@ -217,6 +236,11 @@ export class Store {
 
   markSkipped(id: string, reason: string): void {
     this.db.prepare("INSERT OR IGNORE INTO skipped (id, reason, at) VALUES (?, ?, ?)").run(id, reason, new Date().toISOString());
+  }
+
+  /** After the contact rules change, mail skipped for having no rule is looked at again. */
+  forgetUnmatchedSkips(): number {
+    return Number(this.db.prepare("DELETE FROM skipped WHERE reason LIKE 'no contact rule%'").run().changes);
   }
 
   setNotePath(id: string, notePath: string): void {
@@ -284,8 +308,8 @@ export class Store {
     return (this.db.prepare("SELECT * FROM items WHERE note_path = '' ORDER BY received_at LIMIT ?").all(limit) as Row[]).map(toItem);
   }
 
-  threadItems(threadId: string): Item[] {
-    return (this.db.prepare("SELECT * FROM items WHERE thread_id = ? ORDER BY received_at").all(threadId) as Row[]).map(toItem);
+  threadItems(threadId: string, projectId: string): Item[] {
+    return (this.db.prepare("SELECT * FROM items WHERE thread_id = ? AND project_id = ? ORDER BY received_at, id").all(threadId, projectId) as Row[]).map(toItem);
   }
 
   setDraft(id: string, draft: string | null): void {
@@ -301,15 +325,27 @@ export class Store {
     this.db.prepare("UPDATE items SET attachments_json = ? WHERE id = ?").run(JSON.stringify(attachments), id);
   }
 
-  threadNote(threadId: string): string | null {
-    const row = this.db.prepare("SELECT note_path FROM threads WHERE thread_id = ?").get(threadId) as Row | undefined;
+  /** The note for a thread within one matter: a thread involving two matters has a note in each. */
+  threadNote(threadId: string, projectId: string): string | null {
+    const row = this.db.prepare("SELECT note_path FROM thread_notes WHERE thread_id = ? AND project_id = ?").get(threadId, projectId) as Row | undefined;
     return row ? String(row.note_path) : null;
   }
 
   setThreadNote(threadId: string, projectId: string, notePath: string): void {
     this.db
-      .prepare("INSERT INTO threads (thread_id, project_id, note_path, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET note_path = excluded.note_path")
+      .prepare(
+        "INSERT INTO thread_notes (thread_id, project_id, note_path, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(thread_id, project_id) DO UPDATE SET note_path = excluded.note_path",
+      )
       .run(threadId, projectId, notePath, new Date().toISOString());
+    this.db.prepare("UPDATE items SET note_path = ? WHERE thread_id = ? AND project_id = ? AND note_path != ''").run(notePath, threadId, projectId);
+  }
+
+  /** Items with an attachment that has not been saved yet, received in the last week. */
+  withUnsavedAttachments(limit = 10): Item[] {
+    const since = new Date(Date.now() - 7 * 86_400_000).toISOString();
+    return (
+      this.db.prepare("SELECT * FROM items WHERE attachments_json LIKE '%\"saved\":false%' AND received_at >= ? ORDER BY received_at LIMIT ?").all(since, limit) as Row[]
+    ).map(toItem);
   }
 
   getState(key: string): string | null {

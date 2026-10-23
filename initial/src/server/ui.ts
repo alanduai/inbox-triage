@@ -148,8 +148,12 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
   }
   var toastTimer;
   function toast(text) { var t = $("toast"); t.textContent = text; t.hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(function () { t.hidden = true; }, 6000); }
-  function when(iso) { var d = new Date(iso); return d.toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }); }
-  function localWhen(s) { if (!s) return "—"; var d = new Date(s.length === 10 ? s + "T12:00" : s); return s.length === 10 ? d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" }) : d.toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }); }
+  // Times are shown in the Mac mini's time zone, whatever the browser's, so a deadline reads the same everywhere.
+  function tzOpt(o) { if (S.summary && S.summary.tz) o.timeZone = S.summary.tz; return o; }
+  function when(iso) { if (!iso) return "—"; var d = new Date(iso); return isNaN(d) ? "—" : d.toLocaleString(undefined, tzOpt({ weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })); }
+  function day(s) { if (!s) return "—"; var d = new Date(s + "T12:00:00Z"); return isNaN(d) ? "—" : d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" }); }
+  // Items triaged before deadlines were stored as instants have only the local text.
+  function replyBy(utc, local) { return utc ? when(utc) : local ? local.replace("T", " ") : "—"; }
   function pill(u) { var x = URG[u] || ["Untriaged", 4, "u-none"]; return el("span", "pill " + x[2], x[0]); }
   function rank(i) { return (URG[i.urgency] || [0, 5])[1]; }
   function hasBrackets(t) { return /\[[^\]\n]{1,80}\]/.test(t); }
@@ -176,7 +180,8 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
         : "Rate urgent items to start the measure (" + a.flaggedUrgent + " flagged in 14 days)";
       $("take").textContent = s.urgentOpen ? (s.urgentOpen === 1 ? "1 urgent message needs your reply." : s.urgentOpen + " urgent messages need your reply.") : (s.needsReply ? "Nothing urgent. " + s.needsReply + " to answer." : "Nothing waiting on you.");
       if (s.triageFailed) $("take").textContent += " " + s.triageFailed + " could not be triaged; open them to retry.";
-      $("poll").textContent = s.lastPoll ? ((s.lastPoll.ok ? "Checked Gmail " : "Gmail check failed ") + when(s.lastPoll.at) + (s.lastPoll.ok ? "" : ": " + s.lastPoll.message)) : "Gmail not checked yet";
+      $("poll").textContent = (s.lastPoll ? ((s.lastPoll.ok ? "Checked Gmail " : "Gmail check failed ") + when(s.lastPoll.at) + (s.lastPoll.ok ? "" : ": " + s.lastPoll.message)) : "Gmail not checked yet")
+        + (s.tz && s.tz !== Intl.DateTimeFormat().resolvedOptions().timeZone ? " · times in " + s.tz : "");
       var sel = $("project"); if (sel.options.length === 1) s.projects.forEach(function (p) { sel.appendChild(new Option(p.name, p.id)); });
       renderSetup(s.doctor);
     });
@@ -192,7 +197,7 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
 
   function visible() {
     return S.items.filter(function (i) { return !S.project || i.projectId === S.project; })
-      .sort(function (a, b) { return rank(a) - rank(b) || String(a.replyBy || "9").localeCompare(String(b.replyBy || "9")) || b.receivedAt.localeCompare(a.receivedAt); });
+      .sort(function (a, b) { return rank(a) - rank(b) || String(a.replyByUtc || "9").localeCompare(String(b.replyByUtc || "9")) || b.receivedAt.localeCompare(a.receivedAt); });
   }
 
   function loadItems() {
@@ -211,7 +216,7 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
       if (i.senderVerified === false) meta.appendChild(el("span", "chip bad", "Unverified sender"));
       if (i.onlyCc) meta.appendChild(el("span", "chip", "cc"));
       if (i.reviewRequired) meta.appendChild(el("span", "chip warn", "Review required"));
-      if (i.replyBy && i.status === "needs_reply") meta.appendChild(el("span", "muted", "Reply by " + localWhen(i.replyBy)));
+      if (i.replyBy && i.status === "needs_reply") meta.appendChild(el("span", "muted", "Reply by " + replyBy(i.replyByUtc, i.replyBy)));
       if (i.status === "needs_action") meta.appendChild(el("span", "chip warn", STATUS[i.status]));
       else if (i.status !== "needs_reply") meta.appendChild(el("span", "chip " + (i.status === "triage_failed" ? "warn" : "ok"), STATUS[i.status] || i.status));
       b.appendChild(top); b.appendChild(el("div", "ttl", i.title)); b.appendChild(meta);
@@ -267,7 +272,7 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
       var why = blk("Why it is flagged"); var w = el("div", "why " + ((URG[t.urgency] || [0, 0, ""])[2]));
       w.appendChild(el("p", "", t.urgency_reason));
       var dl = el("dl", "facts");
-      [["Summary", t.summary], ["Task", t.task || "—"], ["Due", localWhen(t.due_date)], ["Reply by", localWhen(t.reply_by)], ["Urgency score", t.urgency_score + " of 100"]].forEach(function (f) { dl.appendChild(el("dt", "", f[0])); dl.appendChild(el("dd", "", f[1])); });
+      [["Summary", t.summary], ["Task", t.task || "—"], ["Due", day(t.due_date)], ["Reply by", replyBy(t.reply_by_utc, t.reply_by)], ["Urgency score", t.urgency_score + " of 100"]].forEach(function (f) { dl.appendChild(el("dt", "", f[0])); dl.appendChild(el("dd", "", f[1])); });
       w.appendChild(dl); why.appendChild(w);
       var fbRow = el("div", "row"); fbRow.appendChild(el("span", "muted", "Right urgency?"));
       var sel = el("select"); sel.setAttribute("aria-label", "Your urgency");
@@ -281,7 +286,14 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
       box.appendChild(why);
     }
 
-    var msg = blk("Message"); msg.appendChild(el("p", "msg", d.body)); box.appendChild(msg);
+    var msg = blk("Message"); msg.appendChild(el("p", "msg", d.body));
+    if (d.quoted) {
+      var qp = el("p", "msg"); qp.hidden = true; qp.textContent = d.quoted;
+      var qb = el("button", "linkbtn", "Show quoted or forwarded text"); qb.type = "button";
+      qb.addEventListener("click", function () { qp.hidden = !qp.hidden; qb.textContent = qp.hidden ? "Show quoted or forwarded text" : "Hide quoted or forwarded text"; });
+      var qr = el("div", "row"); qr.appendChild(qb); msg.appendChild(qr); msg.appendChild(qp);
+    }
+    box.appendChild(msg);
 
     if (d.attachments && d.attachments.length) {
       var at = blk("Attachments"); var ul = el("ul");
@@ -347,7 +359,8 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
     toast("Running triage again…");
     api("POST", "/api/items/" + id + "/retriage").then(function (r) { toast(r.ok ? "Triaged." : "Still failing: " + r.error); refresh(); loadDetail(id); }).catch(function (e) { toast(e.message); });
   }
-  function refresh() { return Promise.all([loadSummary(), loadItems()]).catch(function (e) { toast(e.message); }); }
+  // Summary first: it carries the time zone the list is shown in.
+  function refresh() { return loadSummary().then(loadItems).catch(function (e) { toast(e.message); }); }
 
   $("view").addEventListener("click", function (e) {
     var b = e.target.closest("button[data-v]"); if (!b) return;

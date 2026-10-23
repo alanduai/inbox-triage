@@ -4,7 +4,8 @@ import path from "node:path";
 import { safeFileName, uniquePath, writeFileAtomic } from "../util/files.js";
 import type { FiledAttachment } from "../store/db.js";
 
-const REPLY_PREFIX = /^\s*((re|fwd?|aw|sv|vs|odg|fw|tr|antw)\s*(\[\d+\])?\s*:\s*)+/i;
+// Reply and forward prefixes in English, Swedish (SV, VB), Croatian (Odg) and German Outlook.
+const REPLY_PREFIX = /^\s*((re|fwd?|aw|sv|vs|vb|wg|odg|fw|tr|antw)\s*(\[\d+\])?\s*:\s*)+/i;
 
 export function cleanSubject(subject: string): string {
   return subject.replace(REPLY_PREFIX, "").trim() || "(no subject)";
@@ -12,7 +13,7 @@ export function cleanSubject(subject: string): string {
 
 /** The vault-relative path for a new thread note, for example "Projects/X/2026-10-23 Draft statement.md". */
 export function noteRelPath(folder: string, dateIso: string, subject: string): string {
-  return path.posix.join(folder, `${dateIso.slice(0, 10)} ${safeFileName(cleanSubject(subject), 100)}.md`);
+  return path.posix.join(folder, `${dateIso.slice(0, 10)} ${safeFileName(cleanSubject(subject))}.md`);
 }
 
 export class VaultWriter {
@@ -50,7 +51,7 @@ export class VaultWriter {
    * Obsidian Sync per-file limit. The same file sent twice is stored once.
    */
   saveAttachment(folder: string, dateIso: string, filename: string, data: Buffer, projectId: string): FiledAttachment {
-    const name = `${dateIso.slice(0, 10)} ${safeFileName(filename, 100)}`;
+    const name = `${dateIso.slice(0, 10)} ${safeFileName(filename)}`;
     if (data.length > this.maxSyncBytes) {
       const target = path.join(this.largeDir, projectId, name);
       const final = sameFileOrFree(target, data);

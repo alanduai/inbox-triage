@@ -20,7 +20,7 @@ test("quoted history is dropped in English, Swedish and Croatian", () => {
   assert.equal(stripQuoted("Thanks, see below.\n\nOn Mon, 19 Oct 2026 at 10:00, Elin wrote:\n> old"), "Thanks, see below.");
   assert.equal(stripQuoted("Hej!\n\nDen 23 okt. 2026 kl. 10:12 skrev Elin Holm <elin@x.se>:\n> gammalt"), "Hej!");
   assert.equal(stripQuoted("Poštovani,\nšaljem.\n\nDana 22. 10. 2026. u 9:00 Marija je napisala:\n> staro"), "Poštovani,\nšaljem.");
-  assert.equal(stripQuoted("New text\n\nFrom: Bank <a@b.c>\nSent: Monday\nTo: me\n\nold"), "New text");
+  assert.equal(stripQuoted("New text\n\nFrom: Bank <a@b.c>\nSent: Monday\nTo: me\nSubject: RE: Dokumenti\n\nold"), "New text");
   assert.equal(stripQuoted("> only a quote"), "> only a quote");
 });
 

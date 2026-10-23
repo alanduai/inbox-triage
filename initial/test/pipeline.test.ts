@@ -38,14 +38,14 @@ function gmailMessage(o: { id: string; threadId: string; from: string; to: strin
 class FakeGmail {
   messages = new Map<string, ParsedMessage>();
   // Extra thread entries (your sent replies, drafts) seen only by threadMeta.
-  extra = new Map<string, { id: string; internalDate: Date; labelIds: string[]; fromEmail: string }[]>();
+  extra = new Map<string, { id: string; internalDate: Date; labelIds: string[]; fromEmail: string; recipients: string[] }[]>();
   broken = new Set<string>();
   add(raw: ReturnType<typeof gmailMessage>) {
     this.messages.set(raw.id, parseMessage(raw));
   }
-  addMeta(threadId: string, at: number, labelIds: string[]) {
+  addMeta(threadId: string, at: number, labelIds: string[], recipients = ["elin@lawfirm.example"]) {
     const list = this.extra.get(threadId) ?? [];
-    list.push({ id: `x${list.length}`, internalDate: new Date(at), labelIds, fromEmail: "me@example.com" });
+    list.push({ id: `x${list.length}`, internalDate: new Date(at), labelIds, fromEmail: "me@example.com", recipients });
     this.extra.set(threadId, list);
   }
   async listIds() {
@@ -59,7 +59,9 @@ class FakeGmail {
     return [...this.messages.values()].filter((m) => m.threadId === id);
   }
   async threadMeta(id: string) {
-    const out = [...this.messages.values()].filter((m) => m.threadId === id).map((m) => ({ id: m.id, internalDate: m.internalDate, labelIds: m.labelIds, fromEmail: m.from.email }));
+    const out = [...this.messages.values()]
+      .filter((m) => m.threadId === id)
+      .map((m) => ({ id: m.id, internalDate: m.internalDate, labelIds: m.labelIds, fromEmail: m.from.email, recipients: [...m.to, ...m.cc].map((a) => a.email) }));
     return [...out, ...(this.extra.get(id) ?? [])];
   }
   async attachment() {

@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { LoadedConfig } from "../config.js";
 import { ModelTriage, TRIAGE_JSON_SCHEMA, type Urgency } from "./schema.js";
+import { isValidDate, localToUtc, normalizeLocalDateTime } from "../util/time.js";
 import { systemPrompt, userContent, type TriageInput } from "./prompt.js";
 
 export class TriageError extends Error {
@@ -16,6 +17,8 @@ export interface Triage extends ModelTriage {
   review_required: boolean;
   always_urgent: boolean;
   model: string;
+  // reply_by as a UTC instant, for sorting and showing it correctly in any time zone. "" if none.
+  reply_by_utc: string;
 }
 
 export async function callClaude(client: Anthropic, cfg: LoadedConfig, input: TriageInput): Promise<{ result: ModelTriage; model: string }> {
@@ -55,7 +58,6 @@ export async function callClaude(client: Anthropic, cfg: LoadedConfig, input: Tr
 }
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
-const DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/;
 
 /**
  * Fixed rules applied after the model, so they hold whatever the model wrote:
@@ -64,15 +66,18 @@ const DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/;
  */
 export function finalize(
   result: ModelTriage,
-  opts: { reviewRequired: boolean; alwaysUrgent: boolean; signOff: string; model: string; senderVerified?: boolean | null },
+  opts: { reviewRequired: boolean; alwaysUrgent: boolean; signOff: string; model: string; senderVerified?: boolean | null; tz?: string },
 ): Triage {
   const reviewRequired = opts.reviewRequired || opts.senderVerified === false;
-  const t: Triage = { ...result, review_required: reviewRequired, always_urgent: opts.alwaysUrgent, model: opts.model };
+  const tz = opts.tz ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const t: Triage = { ...result, review_required: reviewRequired, always_urgent: opts.alwaysUrgent, model: opts.model, reply_by_utc: "" };
   t.urgency_score = Math.max(0, Math.min(100, Math.round(t.urgency_score)));
   // Single-line fields stay single-line, so a crafted message cannot split the note's task line.
   for (const k of ["title", "summary", "urgency_reason", "task", "draft_assumption"] as const) t[k] = t[k].replace(/\s+/g, " ").trim();
-  if (!DATE.test(t.due_date)) t.due_date = "";
-  if (!DATETIME.test(t.reply_by)) t.reply_by = "";
+  // Only real dates survive: no 30 February or 25:99; variants with seconds or an offset are normalised.
+  t.due_date = DATE.test(t.due_date.trim()) && isValidDate(t.due_date.trim()) ? t.due_date.trim() : "";
+  t.reply_by = normalizeLocalDateTime(t.reply_by, tz);
+  t.reply_by_utc = t.reply_by ? (localToUtc(t.reply_by, tz)?.toISOString() ?? "") : "";
   t.title = t.title.trim().slice(0, 120) || "(untitled)";
 
   if (!t.needs_reply) {

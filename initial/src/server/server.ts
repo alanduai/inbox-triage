@@ -7,6 +7,7 @@ import { OPEN_STATUSES, type Item, type Store } from "../store/db.js";
 import { URGENCIES, type Urgency } from "../triage/schema.js";
 import type { VaultWriter } from "../obsidian/writer.js";
 import { log } from "../util/time.js";
+import { quotedRest } from "../gmail/parse.js";
 import { dashboardHtml } from "./ui.js";
 
 const COOKIE = "it_token";
@@ -38,6 +39,7 @@ function summaryOf(item: Item, projectName: string) {
     modelUrgency: item.triage?.urgency ?? null,
     urgencyScore: item.triage?.urgency_score ?? null,
     replyBy: item.triage?.reply_by ?? "",
+    replyByUtc: item.triage?.reply_by_utc ?? "",
     status: item.status,
     onlyCc: item.onlyCc,
     senderVerified: item.senderVerified,
@@ -155,6 +157,10 @@ export function createServer(deps: ServerDeps): http.Server {
       if (req.method === "GET" && parts[1] === "summary") {
         const open = store.list("open");
         const needsReply = open.filter((i) => i.status === "needs_reply");
+        // Waiting on you for an answer: replies due, plus messages Claude could not triage yet.
+        const unanswered = open.filter(
+          (i) => i.status === "needs_reply" || i.status === "triage_failed" || (i.status === "pending_triage" && Date.now() - new Date(i.createdAt).getTime() > 5 * 60_000),
+        );
         const needsYou = open.filter((i) => i.status === "needs_reply" || i.status === "needs_action");
         const now = Date.now();
         const since = new Date(now - 14 * 86_400_000).toISOString();
@@ -165,9 +171,10 @@ export function createServer(deps: ServerDeps): http.Server {
           urgentOpen: needsYou.filter((i) => (i.userUrgency ?? i.triage?.urgency) === "urgent").length,
           needsReply: needsReply.length,
           needsAction: needsYou.length - needsReply.length,
-          oldestUnansweredHours: needsReply.length
-            ? Math.floor((now - Math.min(...needsReply.map((i) => new Date(i.receivedAt).getTime()))) / 3_600_000)
+          oldestUnansweredHours: unanswered.length
+            ? Math.floor((now - Math.min(...unanswered.map((i) => new Date(i.receivedAt).getTime()))) / 3_600_000)
             : 0,
+          tz: cfg.tz,
           triageFailed: open.filter((i) => i.status === "triage_failed").length,
           agreement: store.urgencyAgreement(since),
           lastPoll: deps.lastPoll(),
@@ -187,6 +194,7 @@ export function createServer(deps: ServerDeps): http.Server {
             to: item.to,
             cc: item.cc,
             body: item.body,
+            quoted: quotedRest(item.fullText, item.body),
             link: item.link.startsWith("https://mail.google.com/") ? item.link : "",
             attachments: item.attachments,
             notePath: item.notePath,

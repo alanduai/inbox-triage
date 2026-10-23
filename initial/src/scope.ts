@@ -61,13 +61,46 @@ export function isOnlyCc(cfg: Pick<LoadedConfig, "owner">, to: string[], cc: str
   return !inTo && inCc;
 }
 
-/** Mail from the court or the other side is answered through your own lawyer, never directly. */
-export function replyRoute(match: ScopeMatch, sender: { name: string; email: string }): ReplyRoute {
+/** The court and the other side's lawyers: always reviewed, never a quick acknowledgement, whatever the flags say. */
+export function isAdversarial(role: string): boolean {
+  return role === "court" || role === "opposing_counsel";
+}
+
+export function needsReview(contact: ContactConfig): boolean {
+  return contact.reviewRequired || isAdversarial(contact.role);
+}
+
+/**
+ * Who a reply goes to. Mail from the court or the other side is answered through your own lawyer,
+ * never directly. Otherwise the Reply-To address is used when it is on the sender's own domain
+ * (noreply@bank → the banker named in Reply-To); a Reply-To elsewhere is ignored.
+ */
+export function replyRoute(match: ScopeMatch, sender: { name: string; email: string }, replyTo: { name: string; email: string }[] = []): ReplyRoute {
   const { project, contact } = match;
-  if ((contact.role === "court" || contact.role === "opposing_counsel") && project.counsel) {
+  if (isAdversarial(contact.role) && project.counsel) {
     return { name: project.counsel.name, email: project.counsel.email, redirected: true, language: project.counsel.language };
   }
+  const rt = replyTo[0];
+  const senderDomain = domainOf(normalizeEmail(sender.email));
+  if (rt && rt.email && senderDomain && (domainOf(normalizeEmail(rt.email)) === senderDomain || domainOf(normalizeEmail(rt.email)).endsWith("." + senderDomain))) {
+    return { name: rt.name || rt.email, email: normalizeEmail(rt.email), redirected: false };
+  }
   return { name: sender.name || sender.email, email: sender.email, redirected: false };
+}
+
+/** Whether a sent message of yours answers an item: addressed to the item's sender, its reply address, or the sender's domain. */
+export function answers(recipients: string[], item: { fromEmail: string; replyToEmail: string }): boolean {
+  const from = normalizeEmail(item.fromEmail);
+  const domain = domainOf(from);
+  return recipients.some((r) => {
+    const e = normalizeEmail(r);
+    return e === from || e === normalizeEmail(item.replyToEmail) || (domain !== "" && domainOf(e) === domain);
+  });
+}
+
+/** A stable fingerprint of the contact rules, to notice when they change. */
+export function rulesFingerprint(cfg: Pick<LoadedConfig, "projects">): string {
+  return JSON.stringify(cfg.projects.map((p) => [p.id, p.contacts.map((c) => c.match).sort()]));
 }
 
 /** Gmail search for every in-scope sender. Results are filtered again with matchContact. */

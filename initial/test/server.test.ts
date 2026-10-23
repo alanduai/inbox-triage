@@ -11,7 +11,7 @@ function item(id: string): Item {
   const now = new Date().toISOString();
   return {
     id, channel: "gmail", threadId: id, projectId: "croatia-bank", role: "bank", fromName: "Marija", fromEmail: "marija@bank.example",
-    to: ["me@example.com"], cc: [], subject: "Dokumenti", receivedAt: now, body: "Molimo dokumente.", onlyCc: false, senderVerified: true, reopenedAt: null,
+    to: ["me@example.com"], cc: [], subject: "Dokumenti", receivedAt: now, body: "Molimo dokumente.", fullText: "Molimo dokumente.", onlyCc: false, senderVerified: true, reopenedAt: null,
     replyToName: "Marija", replyToEmail: "marija@bank.example", replyRedirected: false, replyLanguage: "", link: "javascript:alert(1)",
     attachments: [], notePath: "", status: "needs_reply", triage: null, triageError: "", draft: null, userUrgency: null, createdAt: now, updatedAt: now,
   };

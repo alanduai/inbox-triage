@@ -59,7 +59,10 @@ test("large bodies served by attachment id are completed", () => {
 });
 
 test("email text is inert in the note", () => {
-  assert.equal(escapeMd("![x](https://t.example/p.png) <img src=x> `code` #tag %%hide%% \\"), "!\\[x\\](https://t.example/p.png) &lt;img src=x> \\`code\\` \\#tag \\%\\%hide\\%\\% \\\\");
+  assert.equal(
+    escapeMd("![x](https://t.example/p.png) <img src=x> `code` #tag %%hide%% \\"),
+    "!\\[x\\](https://t.example/p.png) &lt;img src\\=x> \\`code\\` \\#tag \\%\\%hide\\%\\% \\\\",
+  );
 });
 
 test("frontmatter values keep their type", () => {
