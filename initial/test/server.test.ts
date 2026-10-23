@@ -11,7 +11,7 @@ function item(id: string): Item {
   const now = new Date().toISOString();
   return {
     id, channel: "gmail", threadId: id, projectId: "croatia-bank", role: "bank", fromName: "Marija", fromEmail: "marija@bank.example",
-    to: ["me@example.com"], cc: [], subject: "Dokumenti", receivedAt: now, body: "Molimo dokumente.", onlyCc: false,
+    to: ["me@example.com"], cc: [], subject: "Dokumenti", receivedAt: now, body: "Molimo dokumente.", onlyCc: false, senderVerified: true, reopenedAt: null,
     replyToName: "Marija", replyToEmail: "marija@bank.example", replyRedirected: false, replyLanguage: "", link: "javascript:alert(1)",
     attachments: [], notePath: "", status: "needs_reply", triage: null, triageError: "", draft: null, userUrgency: null, createdAt: now, updatedAt: now,
   };
@@ -60,7 +60,7 @@ test("a network-reachable dashboard needs the token, then works with a cookie", 
 });
 
 test("a this-Mac-only dashboard refuses other host names", async () => {
-  const { base, server } = await start({});
+  const { base, server, store } = await start({});
   try {
     assert.equal((await fetch(`${base}/api/items`)).status, 200);
     // fetch drops a custom Host header, so this request is sent with node:http.
@@ -77,6 +77,11 @@ test("a this-Mac-only dashboard refuses other host names", async () => {
     const summary = (await (await fetch(`${base}/api/summary`)).json()) as { needsReply: number; phase: number };
     assert.equal(summary.needsReply, 0);
     assert.equal(summary.phase, 1);
+
+    // Back to the queue records when, so earlier replies no longer close it.
+    const back = await fetch(`${base}/api/items/abc/status`, { method: "POST", headers: { "x-inbox-triage": "1", "content-type": "application/json" }, body: JSON.stringify({ status: "needs_reply" }) });
+    assert.equal(back.status, 200);
+    assert.ok(store.get("abc")!.reopenedAt);
   } finally {
     server.close();
   }

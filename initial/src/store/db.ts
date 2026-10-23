@@ -31,6 +31,8 @@ export interface Item {
   receivedAt: string;
   body: string;
   onlyCc: boolean;
+  // Gmail's sender authentication for the From domain; null when Gmail reported none.
+  senderVerified: boolean | null;
   replyToName: string;
   replyToEmail: string;
   replyRedirected: boolean;
@@ -43,6 +45,8 @@ export interface Item {
   triageError: string;
   draft: string | null;
   userUrgency: Urgency | null;
+  // Set when you put a closed item back in the queue; replies sent before it no longer close it.
+  reopenedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -76,6 +80,8 @@ CREATE TABLE IF NOT EXISTS items (
   triage_error TEXT NOT NULL DEFAULT '',
   draft TEXT,
   user_urgency TEXT,
+  sender_verified INTEGER,
+  reopened_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -125,6 +131,8 @@ function toItem(r: Row): Item {
     triageError: String(r.triage_error ?? ""),
     draft: r.draft == null ? null : String(r.draft),
     userUrgency: r.user_urgency == null ? null : (String(r.user_urgency) as Urgency),
+    senderVerified: r.sender_verified == null ? null : Number(r.sender_verified) === 1,
+    reopenedAt: r.reopened_at == null ? null : String(r.reopened_at),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
   };
@@ -138,6 +146,10 @@ export class Store {
     this.db = new DatabaseSync(file);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
     this.db.exec(SCHEMA);
+    // Columns added after the first release.
+    const cols = new Set((this.db.prepare("PRAGMA table_info(items)").all() as Row[]).map((r) => String(r.name)));
+    if (!cols.has("sender_verified")) this.db.exec("ALTER TABLE items ADD COLUMN sender_verified INTEGER");
+    if (!cols.has("reopened_at")) this.db.exec("ALTER TABLE items ADD COLUMN reopened_at TEXT");
     if (file !== ":memory:") fs.chmodSync(file, 0o600);
   }
 
@@ -154,8 +166,8 @@ export class Store {
       .prepare(
         `INSERT INTO items (id, channel, thread_id, project_id, role, from_name, from_email, to_json, cc_json, subject, received_at, body,
           only_cc, reply_to_name, reply_to_email, reply_redirected, reply_language, link, attachments_json, note_path, status,
-          triage_json, triage_error, draft, user_urgency, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          triage_json, triage_error, draft, user_urgency, sender_verified, reopened_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         item.id,
@@ -183,6 +195,8 @@ export class Store {
         item.triageError,
         item.draft,
         item.userUrgency,
+        item.senderVerified == null ? null : item.senderVerified ? 1 : 0,
+        item.reopenedAt,
         item.createdAt,
         item.updatedAt,
       );
@@ -223,17 +237,22 @@ export class Store {
     return (this.db.prepare(`SELECT DISTINCT thread_id FROM items WHERE status IN (${open})`).all() as Row[]).map((r) => String(r.thread_id));
   }
 
+  /** Stores a triage. The status follows it only while the item is still waiting for one, so a choice you made stays. */
   saveTriage(id: string, triage: Triage): void {
     const status: Status = triage.needs_reply ? "needs_reply" : "no_reply_needed";
     this.db
-      .prepare("UPDATE items SET triage_json = ?, triage_error = '', status = ?, updated_at = ? WHERE id = ?")
+      .prepare(
+        "UPDATE items SET triage_json = ?, triage_error = '', status = CASE WHEN status IN ('pending_triage', 'triage_failed') THEN ? ELSE status END, updated_at = ? WHERE id = ?",
+      )
       .run(JSON.stringify(triage), status, new Date().toISOString(), id);
     this.log(id, "triaged", `${triage.urgency} ${triage.urgency_score}`);
   }
 
   saveTriageError(id: string, error: string): void {
     this.db
-      .prepare("UPDATE items SET triage_error = ?, status = 'triage_failed', updated_at = ? WHERE id = ?")
+      .prepare(
+        "UPDATE items SET triage_error = ?, status = CASE WHEN status = 'pending_triage' THEN 'triage_failed' ELSE status END, updated_at = ? WHERE id = ?",
+      )
       .run(error, new Date().toISOString(), id);
     this.log(id, "triage_failed", error);
   }
@@ -241,6 +260,22 @@ export class Store {
   setStatus(id: string, status: Status, reason: string): void {
     this.db.prepare("UPDATE items SET status = ?, updated_at = ? WHERE id = ?").run(status, new Date().toISOString(), id);
     this.log(id, "status", `${status}: ${reason}`);
+  }
+
+  /** Back in the queue by your choice: earlier replies no longer close it. */
+  reopen(id: string): void {
+    const now = new Date().toISOString();
+    this.db.prepare("UPDATE items SET status = 'needs_reply', reopened_at = ?, updated_at = ? WHERE id = ?").run(now, now, id);
+    this.log(id, "status", "needs_reply: reopened in dashboard");
+  }
+
+  /** Items whose note was never written (a failed write, or a stop during triage). */
+  unfiled(limit = 10): Item[] {
+    return (this.db.prepare("SELECT * FROM items WHERE note_path = '' ORDER BY received_at LIMIT ?").all(limit) as Row[]).map(toItem);
+  }
+
+  threadItems(threadId: string): Item[] {
+    return (this.db.prepare("SELECT * FROM items WHERE thread_id = ? ORDER BY received_at").all(threadId) as Row[]).map(toItem);
   }
 
   setDraft(id: string, draft: string | null): void {

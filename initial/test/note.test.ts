@@ -37,6 +37,7 @@ test("a section quotes the message and lists attachments", () => {
     receivedLocal: "2026-10-23 10:12",
     fromName: "Elin Holm",
     fromEmail: "elin@lawfirm.example",
+    senderVerified: true,
     link: "https://mail.google.com/x",
     onlyCc: true,
     body: "Line one\n\nLine two",
@@ -47,7 +48,7 @@ test("a section quotes the message and lists attachments", () => {
     triage: null,
     triageError: "Claude API 500",
   });
-  assert.match(s, /^## 2026-10-23 10:12 · Elin Holm/);
+  assert.match(s, /^## 2026-10-23 10:12 · Elin Holm \(elin@lawfirm.example\)/);
   assert.match(s, /you were in cc/);
   assert.match(s, /> Line one\n>\n> Line two/);
   assert.match(s, /\[\[Projects\/X\/attachments\/2026-10-23 Draft.pdf\|Draft.pdf\]\]/);

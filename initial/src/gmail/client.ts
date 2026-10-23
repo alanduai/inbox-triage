@@ -1,6 +1,6 @@
 import { gmail, type gmail_v1 } from "@googleapis/gmail";
 import type { OAuth2Client } from "google-auth-library";
-import { decodeBase64Url, parseMessage, type AttachmentRef, type ParsedMessage } from "./parse.js";
+import { completeBody, decodeBase64Url, parseAddressList, parseMessage, type AttachmentRef, type ParsedMessage } from "./parse.js";
 
 /** The few Gmail calls phase 1 needs. Read-only. */
 export class GmailReader {
@@ -15,28 +15,41 @@ export class GmailReader {
     return res.data.emailAddress ?? "";
   }
 
-  /** Message ids matching a Gmail search, newest first, up to maxPages × 100. */
-  async listIds(query: string, maxPages = 5): Promise<string[]> {
+  /** Message ids matching a Gmail search, newest first, up to maxPages × 100; truncated when more remained. */
+  async listIds(query: string, maxPages = 20): Promise<{ ids: string[]; truncated: boolean }> {
     const ids: string[] = [];
     let pageToken: string | undefined;
     for (let page = 0; page < maxPages; page++) {
       const res = await this.api.users.messages.list({ userId: "me", q: query, maxResults: 100, pageToken });
       for (const m of res.data.messages ?? []) if (m.id) ids.push(m.id);
       pageToken = res.data.nextPageToken ?? undefined;
-      if (!pageToken) break;
+      if (!pageToken) return { ids, truncated: false };
     }
-    return ids;
+    return { ids, truncated: true };
   }
 
   async message(id: string): Promise<ParsedMessage> {
     const res = await this.api.users.messages.get({ userId: "me", id, format: "full" });
-    return parseMessage(res.data);
+    return this.complete(parseMessage(res.data));
   }
 
-  /** Every message of a thread, oldest first. */
+  /** Every message of a thread, oldest first, without drafts. */
   async thread(id: string): Promise<ParsedMessage[]> {
     const res = await this.api.users.threads.get({ userId: "me", id, format: "full" });
-    return (res.data.messages ?? []).map(parseMessage).sort((a, b) => a.internalDate.getTime() - b.internalDate.getTime());
+    const messages = (res.data.messages ?? []).filter((m) => !(m.labelIds ?? []).includes("DRAFT")).map(parseMessage);
+    const complete = await Promise.all(messages.map((m) => this.complete(m)));
+    return complete.sort((a, b) => a.internalDate.getTime() - b.internalDate.getTime());
+  }
+
+  /** Large messages keep their text behind an attachment id; fetch it so the body is not empty. */
+  private async complete(msg: ParsedMessage): Promise<ParsedMessage> {
+    if (!msg.deferredBody.length) return msg;
+    const fetched = [];
+    for (const part of msg.deferredBody) {
+      const res = await this.api.users.messages.attachments.get({ userId: "me", messageId: msg.id, id: part.attachmentId });
+      fetched.push({ mimeType: part.mimeType, data: decodeBase64Url(res.data.data ?? ""), charset: part.charset });
+    }
+    return completeBody(msg, fetched);
   }
 
   /** Light view of a thread: who wrote each message and when, without bodies. */
@@ -48,7 +61,7 @@ export class GmailReader {
         id: m.id ?? "",
         internalDate: new Date(Number(m.internalDate ?? 0)),
         labelIds: m.labelIds ?? [],
-        fromEmail: (from.match(/<([^>]+)>/)?.[1] ?? from).trim().toLowerCase(),
+        fromEmail: parseAddressList(from)[0]?.email ?? "",
       };
     });
   }

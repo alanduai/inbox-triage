@@ -2,7 +2,7 @@
 
 Reads new Gmail from the people in your two private matters, triages each message with Claude, files it into your Obsidian vault, and shows a dashboard with a suggested reply you can edit. It runs on the Mac mini.
 
-**Phase 1 sends nothing.** Gmail access is read-only. To answer, copy the reply from the dashboard and send it from Gmail or Superhuman. The item closes on its own once your reply shows up in Gmail.
+**Phase 1 sends nothing.** Gmail access is read-only. To answer, copy the reply from the dashboard and send it from Gmail or Superhuman. The item closes on its own once your sent reply shows up in Gmail; a draft you are still writing does not close it.
 
 | Phase | Adds |
 |---|---|
@@ -13,8 +13,8 @@ Reads new Gmail from the people in your two private matters, triages each messag
 
 ## What happens to a message
 
-1. Every minute the service asks Gmail for new mail from the senders listed in `config.json`. It searches all mail, so messages Superhuman auto-archived are found too. Your own mail and Superhuman's reminder emails are ignored.
-2. Rules in the config decide the matter, the sender's role (your lawyer, the court, the other side, bank, advisor) and whether replies need review.
+1. Every minute the service asks Gmail for new mail from the senders listed in `config.json`. Each check looks back a week, so mail that reaches the inbox late (rescued from spam, restored from trash) is still found. It searches all mail, so messages Superhuman auto-archived are found too. Your own mail and Superhuman's reminder emails are ignored.
+2. Rules in the config decide the matter, the sender's role (your lawyer, the court, the other side, bank, advisor) and whether replies need review. Gmail's own sender check (DMARC, DKIM, SPF) is read too: mail that fails it is marked **Unverified sender**, because the From address may be forged.
 3. Claude (`claude-opus-5-5`) reads the message and up to six earlier messages in its thread. It returns:
    - a title, a summary, the urgency and the reason for it, the task, the due date and a reply-by time;
    - a suggested reply in the sender's language (English, Croatian or Swedish), ending with your sign-off;
@@ -22,7 +22,8 @@ Reads new Gmail from the people in your two private matters, triages each messag
 4. Fixed rules then apply on top of what Claude returned:
    - Senders marked `alwaysUrgent` are raised to urgent.
    - The court and the other side's lawyers get no acknowledgement.
-   - When you are only in cc on their mail, the draft is written to your own lawyer instead.
+   - Mail from the court or the other side is always answered through your own lawyer: the draft is written to her, whether you are in To or only in cc.
+   - An unverified sender gets no acknowledgement and is never raised to urgent.
    - Facts only you know are left as `[brackets]`.
 5. The message is filed in the vault. Attachments are saved in the matter's `attachments/` folder, except files over your Obsidian Sync limit, which stay in `data/large-attachments/` and are linked from the note.
 6. The dashboard lists open items, urgent first. Mark each one's urgency as right or wrong. The share of urgent flags you agree with is the phase 1 measure; the target is 90% or more.
@@ -58,7 +59,7 @@ npm run init          # creates config.json and the private data/ folder
 - `projects`: the real addresses and domains for each matter. An exact address beats a domain rule.
   - Give the court and the other side's law firm `"reviewRequired": true`.
   - Give your lawyer, the court and your bank contact `"alwaysUrgent": true`.
-  - Set `counsel` to your own lawyer in the Swedish matter, so mail where you are only in cc gets a draft addressed to her.
+  - Set `counsel` to your own lawyer in the Swedish matter, so drafts answering the court or the other side are addressed to her.
 - `signOffs` are already set to "Best regards, Alan", "Lijep pozdrav, Alan" and "Med vänlig hälsning, Alan".
 
 ### 2. Let the app read Gmail
@@ -120,7 +121,8 @@ The connection is plain HTTP inside your home network. Don't forward the port on
 ## Privacy and safety
 
 - **Sent to Claude:** the text of in-scope messages, up to six earlier messages in each thread, and the senders' names and addresses. Attachments are not sent; only their names and sizes are.
-- **Messages are treated as untrusted data.** The model that reads them has no tools. It is told never to follow instructions inside a message, and requests to change bank details or move money are flagged as possible fraud.
+- **Messages are treated as untrusted data.** The model that reads them has no tools. It is told never to follow instructions inside a message, and requests to change bank details or move money are flagged as possible fraud. The sender's display name is never placed among the trusted facts in the prompt.
+- **Notes are inert.** Email text is escaped before it goes into a note, so a message cannot load images, run code or add tags in Obsidian.
 - **Stored on the Mac mini:** the message store, Gmail token and logs are in `data/`, readable only by you.
   - FileVault encrypts them on disk. With FileVault on, macOS turns automatic login off, so after a power cut the service starts only once someone logs in.
   - With FileVault off, the Mac starts unattended, but legal notes and tokens sit unencrypted on disk. `npm run doctor` shows which way you have it.

@@ -73,7 +73,7 @@ async function main(argv: string[]): Promise<number> {
       const store = openStore(cfg);
       try {
         const r = await makePipeline(cfg, store).pollOnce();
-        console.log(`matched ${r.matched}, filed ${r.ingested}, failed ${r.failed}, closed by your replies ${r.closedByReply}`);
+        console.log(`matched ${r.matched}, filed ${r.ingested}, finished earlier ones ${r.refiled}, failed ${r.failed}, closed by your replies ${r.closedByReply}`);
         return r.failed ? 1 : 0;
       } finally {
         store.close();
@@ -106,12 +106,19 @@ async function runService(): Promise<number> {
 
   let timer: NodeJS.Timeout | undefined;
   let stopping = false;
+  let running: Promise<unknown> = Promise.resolve();
   const tick = async () => {
     if (!pipeline || stopping) return;
     try {
-      const r = await pipeline.pollOnce();
-      lastPoll = { at: new Date().toISOString(), ok: r.failed === 0, message: `${r.ingested} new, ${r.failed} failed, ${r.closedByReply} closed by your replies` };
-      if (r.ingested || r.failed || r.closedByReply) log(`poll: ${lastPoll.message}`);
+      const poll = pipeline.pollOnce();
+      running = poll.catch(() => undefined);
+      const r = await poll;
+      lastPoll = {
+        at: new Date().toISOString(),
+        ok: r.failed === 0,
+        message: `${r.ingested} new, ${r.refiled} finished, ${r.failed} failed, ${r.closedByReply} closed by your replies`,
+      };
+      if (r.ingested || r.failed || r.refiled || r.closedByReply) log(`poll: ${lastPoll.message}`);
     } catch (err) {
       lastPoll = { at: new Date().toISOString(), ok: false, message: err instanceof Error ? err.message : String(err) };
       log("poll failed", err);
@@ -125,7 +132,9 @@ async function runService(): Promise<number> {
     const stop = () => {
       stopping = true;
       if (timer) clearTimeout(timer);
-      server.close(() => resolve());
+      // Let a poll in progress finish its note (at most a minute), so nothing is left half-filed.
+      const grace = new Promise((r) => setTimeout(r, 60_000).unref());
+      void Promise.race([running, grace]).then(() => server.close(() => resolve()));
     };
     process.once("SIGTERM", stop);
     process.once("SIGINT", stop);

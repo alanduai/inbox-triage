@@ -11,7 +11,7 @@ import { Store } from "../src/store/db.js";
 import { parseConfig } from "../src/config.js";
 import { b64url, tempDir, testConfig } from "./helpers.js";
 
-function gmailMessage(o: { id: string; threadId: string; from: string; to: string; cc?: string; subject: string; body: string; at: number; labels?: string[]; attachment?: boolean }) {
+function gmailMessage(o: { id: string; threadId: string; from: string; to: string; cc?: string; subject: string; body: string; at: number; labels?: string[]; attachment?: boolean; auth?: string }) {
   return {
     id: o.id,
     threadId: o.threadId,
@@ -25,6 +25,7 @@ function gmailMessage(o: { id: string; threadId: string; from: string; to: strin
         { name: "Cc", value: o.cc ?? "" },
         { name: "Subject", value: o.subject },
         { name: "Message-ID", value: `<${o.id}@mail.example>` },
+        ...(o.auth ? [{ name: "Authentication-Results", value: o.auth }] : []),
       ],
       parts: [
         { mimeType: "text/plain", body: { data: b64url(o.body) } },
@@ -36,14 +37,22 @@ function gmailMessage(o: { id: string; threadId: string; from: string; to: strin
 
 class FakeGmail {
   messages = new Map<string, ParsedMessage>();
-  sentInThread = new Map<string, number>();
+  // Extra thread entries (your sent replies, drafts) seen only by threadMeta.
+  extra = new Map<string, { id: string; internalDate: Date; labelIds: string[]; fromEmail: string }[]>();
+  broken = new Set<string>();
   add(raw: ReturnType<typeof gmailMessage>) {
     this.messages.set(raw.id, parseMessage(raw));
   }
+  addMeta(threadId: string, at: number, labelIds: string[]) {
+    const list = this.extra.get(threadId) ?? [];
+    list.push({ id: `x${list.length}`, internalDate: new Date(at), labelIds, fromEmail: "me@example.com" });
+    this.extra.set(threadId, list);
+  }
   async listIds() {
-    return [...this.messages.keys()].reverse();
+    return { ids: [...this.broken, ...this.messages.keys()].reverse(), truncated: false };
   }
   async message(id: string) {
+    if (this.broken.has(id)) throw new RangeError("Invalid code point 1114112");
     return this.messages.get(id)!;
   }
   async thread(id: string) {
@@ -51,9 +60,7 @@ class FakeGmail {
   }
   async threadMeta(id: string) {
     const out = [...this.messages.values()].filter((m) => m.threadId === id).map((m) => ({ id: m.id, internalDate: m.internalDate, labelIds: m.labelIds, fromEmail: m.from.email }));
-    const sent = this.sentInThread.get(id);
-    if (sent) out.push({ id: "sent1", internalDate: new Date(sent), labelIds: ["SENT"], fromEmail: "me@example.com" });
-    return out;
+    return [...out, ...(this.extra.get(id) ?? [])];
   }
   async attachment() {
     return Buffer.from("%PDF-");
@@ -106,7 +113,7 @@ test("a new message is triaged, filed to Obsidian, and closed when you reply", a
   const pipeline = new Pipeline(cfg, store, gmail as unknown as GmailReader, claude.client, new VaultWriter(vaultDir, 1_000_000, path.join(vaultDir, "..", "large")));
 
   const r1 = await pipeline.pollOnce();
-  assert.deepEqual(r1, { matched: 1, ingested: 1, failed: 0, closedByReply: 0 });
+  assert.deepEqual(r1, { matched: 1, ingested: 1, failed: 0, refiled: 0, closedByReply: 0 });
   assert.ok(store.isSkipped("1a00000000000001"));
 
   const item = store.get("19c421a3b46d9a6b")!;
@@ -130,7 +137,7 @@ test("a new message is triaged, filed to Obsidian, and closed when you reply", a
   assert.equal(params.fallbacks, "default");
   assert.equal(params.output_config.format.type, "json_schema");
   assert.match(params.system, /untrusted data/);
-  assert.match(params.messages[0]!.content, /Reply goes to: Elin Holm <elin@lawfirm.example> \(the sender\)/);
+  assert.match(params.messages[0]!.content, /Reply goes to: the sender \(elin@lawfirm.example\)/);
 
   // You edit the note on another device; a second message in the thread keeps your edit.
   const edited = note.replace("# Draft statement\n", "# Draft statement\n\nMy own note.\n").replace("tags: [inbox, gmail]", "tags: [inbox, gmail]\nmine: keep");
@@ -144,14 +151,27 @@ test("a new message is triaged, filed to Obsidian, and closed when you reply", a
   assert.match(note2, /Reminder: Monday\./);
   assert.equal((note2.match(/^## /gm) ?? []).length, 2);
 
+  // A draft you saved in Gmail is not a reply: nothing closes.
+  gmail.addMeta("19c421a3b46d9a6b", t0 + 5_000_000, ["DRAFT"]);
+  assert.equal((await pipeline.pollOnce()).closedByReply, 0);
+  assert.equal(store.get("19c421a3b46d9a6b")!.status, "needs_reply");
+
   // You answer from Gmail or Superhuman: the next poll closes both and ticks their tasks.
-  gmail.sentInThread.set("19c421a3b46d9a6b", t0 + 7_200_000);
+  gmail.addMeta("19c421a3b46d9a6b", t0 + 7_200_000, ["SENT"]);
   const r3 = await pipeline.pollOnce();
   assert.equal(r3.closedByReply, 2);
   assert.equal(store.get("19c421a3b46d9a6b")!.status, "replied");
   const note3 = fs.readFileSync(path.join(vaultDir, item.notePath), "utf8");
   assert.match(note3, /- \[x\] Review sections 3 and 4/);
   assert.match(note3, /status: replied/);
+
+  // You put it back in the queue: that same reply no longer closes it.
+  pipeline.setStatus("19c421a3b46d9a6b", "needs_reply", "test");
+  assert.ok(store.get("19c421a3b46d9a6b")!.reopenedAt);
+  assert.equal((await pipeline.pollOnce()).closedByReply, 0);
+  assert.equal(store.get("19c421a3b46d9a6b")!.status, "needs_reply");
+  // The note describes the thread: one item still open, so the thread is open.
+  assert.match(fs.readFileSync(path.join(vaultDir, item.notePath), "utf8"), /status: needs_reply/);
   store.close();
 });
 
@@ -187,6 +207,74 @@ test("court mail in cc is routed to your lawyer, gets no acknowledgement, and a 
   const note = fs.readFileSync(path.join(vaultDir, bank.notePath), "utf8");
   assert.match(note, /- \[ \] Triage this message by hand \^it-1b00000000000002/);
   store.close();
+});
+
+test("one unreadable message does not block the others, and an unfiled item is finished later", async () => {
+  const vaultDir = tempDir("vault-");
+  const cfg = testConfig({ vault: { path: vaultDir } });
+  const store = new Store(":memory:");
+  const gmail = new FakeGmail();
+  const t0 = Date.UTC(2026, 9, 23, 9, 0);
+  gmail.broken.add("1c00000000000009");
+  gmail.add(gmailMessage({ id: "1c00000000000001", threadId: "1c00000000000001", from: "Bank <info@bank.example>", to: "me@example.com", subject: "Statement", body: "Attached.", at: t0 }));
+  const claude = fakeClaude([{ ...answer, needs_reply: false, task: "", urgency: "fyi" }]);
+  const vault = new VaultWriter(vaultDir, 1_000_000, path.join(vaultDir, "..", "large"));
+  // The first note write fails, as on a full disk.
+  const realWrite = vault.write.bind(vault);
+  let failOnce = true;
+  vault.write = (rel: string, content: string) => {
+    if (failOnce) {
+      failOnce = false;
+      throw new Error("ENOSPC: no space left on device");
+    }
+    realWrite(rel, content);
+  };
+  const pipeline = new Pipeline(cfg, store, gmail as unknown as GmailReader, claude.client, vault);
+
+  const r = await pipeline.pollOnce();
+  assert.equal(r.failed, 2, "the unreadable message and the failed write");
+  assert.equal(r.refiled, 1, "the stored item is finished in the same poll, without calling Claude again");
+  const item = store.get("1c00000000000001")!;
+  assert.equal(item.status, "no_reply_needed");
+  assert.ok(item.notePath && fs.existsSync(path.join(vaultDir, item.notePath)));
+  assert.equal(claude.calls.length, 1);
+  store.close();
+});
+
+test("an unverified sender gets no acknowledgement, no always-urgent lift, and a warning in the note", async () => {
+  const vaultDir = tempDir("vault-");
+  const cfg = testConfig({ vault: { path: vaultDir } });
+  const store = new Store(":memory:");
+  const gmail = new FakeGmail();
+  gmail.add(
+    gmailMessage({
+      id: "1d00000000000001",
+      threadId: "1d00000000000001",
+      from: "Elin Holm <elin@lawfirm.example>",
+      to: "me@example.com",
+      subject: "New bank details",
+      body: "Please pay to the new account.",
+      at: Date.UTC(2026, 9, 23, 9, 0),
+      auth: "mx.google.com; dkim=fail header.i=@lawfirm.example; spf=softfail smtp.mailfrom=evil.example; dmarc=fail (p=NONE) header.from=lawfirm.example",
+    }),
+  );
+  const claude = fakeClaude([{ ...answer, urgency: "today" }]);
+  const pipeline = new Pipeline(cfg, store, gmail as unknown as GmailReader, claude.client, new VaultWriter(vaultDir, 1_000_000, path.join(vaultDir, "..", "large")));
+  await pipeline.pollOnce();
+  const item = store.get("1d00000000000001")!;
+  assert.equal(item.senderVerified, false);
+  assert.equal(item.triage?.urgency, "today", "not raised to urgent");
+  assert.equal(item.triage?.ack_reply, "");
+  assert.equal(item.triage?.review_required, true);
+  assert.match((claude.calls[0] as { messages: { content: string }[] }).messages[0]!.content, /Sender authentication: FAILED/);
+  assert.match(fs.readFileSync(path.join(vaultDir, item.notePath), "utf8"), /sender not verified by Gmail/);
+  store.close();
+});
+
+test("config refuses a project folder outside the vault", () => {
+  const base = JSON.parse(JSON.stringify(testConfig()));
+  base.projects[0].folder = "../Elsewhere";
+  assert.throws(() => parseConfig(base, "/tmp/c.json"), /inside the vault/);
 });
 
 test("config refuses a network-reachable dashboard without a token", () => {

@@ -64,10 +64,13 @@ const DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/;
  */
 export function finalize(
   result: ModelTriage,
-  opts: { reviewRequired: boolean; alwaysUrgent: boolean; signOff: string; model: string },
+  opts: { reviewRequired: boolean; alwaysUrgent: boolean; signOff: string; model: string; senderVerified?: boolean | null },
 ): Triage {
-  const t: Triage = { ...result, review_required: opts.reviewRequired, always_urgent: opts.alwaysUrgent, model: opts.model };
+  const reviewRequired = opts.reviewRequired || opts.senderVerified === false;
+  const t: Triage = { ...result, review_required: reviewRequired, always_urgent: opts.alwaysUrgent, model: opts.model };
   t.urgency_score = Math.max(0, Math.min(100, Math.round(t.urgency_score)));
+  // Single-line fields stay single-line, so a crafted message cannot split the note's task line.
+  for (const k of ["title", "summary", "urgency_reason", "task", "draft_assumption"] as const) t[k] = t[k].replace(/\s+/g, " ").trim();
   if (!DATE.test(t.due_date)) t.due_date = "";
   if (!DATETIME.test(t.reply_by)) t.reply_by = "";
   t.title = t.title.trim().slice(0, 120) || "(untitled)";
@@ -78,9 +81,10 @@ export function finalize(
     t.draft_assumption = "";
     if (t.urgency !== "fyi" && !t.task) t.urgency = "fyi";
   }
-  if (opts.reviewRequired) t.ack_reply = "";
+  if (opts.reviewRequired || opts.senderVerified === false) t.ack_reply = "";
 
-  if (opts.alwaysUrgent && t.needs_reply && t.urgency !== "urgent") {
+  // An unverified sender never gets the always-urgent lift: that is what a forger would want.
+  if (opts.alwaysUrgent && opts.senderVerified !== false && t.needs_reply && t.urgency !== "urgent") {
     t.urgency = "urgent" as Urgency;
     t.urgency_score = Math.max(t.urgency_score, 80);
     t.urgency_reason = `${t.urgency_reason} Raised to urgent: this sender is always urgent.`.trim();
@@ -91,12 +95,28 @@ export function finalize(
   return t;
 }
 
+/**
+ * Ends a draft with the configured sign-off. A different closing the model wrote ("Kind regards,"
+ * followed by your name) is replaced rather than doubled.
+ */
 export function withSignOff(text: string, signOff: string): string {
-  const body = text.trimEnd();
+  let body = text.trimEnd();
   if (!body) return "";
-  const firstLine = signOff.split("\n")[0]?.trim() ?? "";
-  const tail = body.slice(-Math.max(200, signOff.length + 40));
-  if (firstLine && tail.includes(firstLine)) return body;
+  const parts = signOff.split("\n").map((l) => l.trim());
+  const name = parts[parts.length - 1] ?? "";
+  if (body.endsWith(signOff.trim())) return body;
+  const lines = body.split("\n");
+  const last = lines[lines.length - 1]?.trim() ?? "";
+  const prev = lines[lines.length - 2]?.trim() ?? "";
+  if (name && last === name) {
+    lines.pop();
+    if (/[,!]$/.test(prev) && prev.split(" ").length <= 5) lines.pop();
+    body = lines.join("\n").trimEnd();
+  } else if (name && last.endsWith(name) && last.split(" ").length <= 6) {
+    // "Best regards, Alan" on one line.
+    lines.pop();
+    body = lines.join("\n").trimEnd();
+  }
   return `${body}\n\n${signOff}`;
 }
 

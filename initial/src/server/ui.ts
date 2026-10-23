@@ -62,7 +62,7 @@ select { font-size: 13px; padding: 4px 8px; border: 1px solid var(--line); borde
 .pill { padding: 0 6px; border: 1px solid currentColor; border-radius: 999px; font-size: 12px; white-space: nowrap; }
 .pill.u-urgent { color: var(--bad); } .pill.u-today { color: var(--warn); } .pill.u-week, .pill.u-fyi, .pill.u-none { color: var(--muted); }
 .chip { padding: 0 6px; border-radius: 6px; background: var(--chip); border: 1px solid var(--line); font-size: 12px; white-space: nowrap; }
-.chip.ok { color: var(--ok); background: none; border-color: currentColor; } .chip.warn { color: var(--warn); background: none; border-color: currentColor; }
+.chip.ok { color: var(--ok); background: none; border-color: currentColor; } .chip.warn { color: var(--warn); background: none; border-color: currentColor; } .chip.bad { color: var(--bad); background: none; border-color: currentColor; }
 .detail { padding: 18px 20px; min-height: 16rem; }
 .detail h2 { font-size: 18px; margin: 8px 0 2px; }
 .blk { margin-top: 18px; }
@@ -203,6 +203,7 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
       var b = el("button", "item " + ((URG[i.urgency] || [0, 0, ""])[2])); b.type = "button"; b.setAttribute("role", "option"); b.setAttribute("aria-selected", String(i.id === S.sel));
       var top = el("div", "top"); top.appendChild(el("span", "from", i.fromName || i.fromEmail)); top.appendChild(el("span", "", when(i.receivedAt)));
       var meta = el("div", "meta"); meta.appendChild(pill(i.urgency)); meta.appendChild(el("span", "chip", i.projectName));
+      if (i.senderVerified === false) meta.appendChild(el("span", "chip bad", "Unverified sender"));
       if (i.onlyCc) meta.appendChild(el("span", "chip", "cc"));
       if (i.reviewRequired) meta.appendChild(el("span", "chip warn", "Review required"));
       if (i.replyBy && i.status === "needs_reply") meta.appendChild(el("span", "muted", "Reply by " + localWhen(i.replyBy)));
@@ -239,6 +240,7 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
     var t = d.triage;
     var top = el("div", "meta");
     top.appendChild(el("span", "chip", "Gmail")); top.appendChild(pill(d.urgency)); top.appendChild(el("span", "muted", "Received " + when(d.receivedAt)));
+    if (d.senderVerified === false) top.appendChild(el("span", "chip bad", "Unverified sender"));
     if (d.onlyCc) top.appendChild(el("span", "chip", "You were in cc"));
     if (d.reviewRequired) top.appendChild(el("span", "chip warn", "Review required"));
     top.appendChild(el("span", "chip " + (d.status === "triage_failed" ? "warn" : d.status === "needs_reply" ? "" : "ok"), STATUS[d.status] || d.status));
@@ -246,10 +248,11 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
     box.appendChild(el("h2", "", d.title));
     if (t && t.title !== d.subject) box.appendChild(el("p", "muted", "Subject: " + d.subject));
     box.appendChild(el("p", "muted", (d.fromName ? d.fromName + " · " : "") + d.fromEmail + " · " + d.projectName));
+    if (d.senderVerified === false) box.appendChild(el("p", "redirect", "Gmail could not verify that this came from " + d.fromEmail + ". The address may be forged: check it in Gmail before acting on anything it asks."));
     if (d.replyRedirected) box.appendChild(el("p", "redirect", "Your reply goes to " + d.replyToName + " (" + d.replyToEmail + "), your own lawyer, not to this sender."));
     var links = el("div", "row");
     if (d.link) { var a = el("a", "btn", "Open in Gmail ↗"); a.href = d.link; a.target = "_blank"; a.rel = "noopener noreferrer"; links.appendChild(a); }
-    if (d.status === "triage_failed") links.appendChild(btn("Retry triage", "", function () { retriage(d.id); }));
+    if (d.status === "triage_failed" || d.stuck) links.appendChild(btn("Retry triage", "", function () { retriage(d.id); }));
     box.appendChild(links);
 
     if (d.triageError) { var fb = blk("Triage failed"); fb.appendChild(el("p", "assume", d.triageError)); box.appendChild(fb); }

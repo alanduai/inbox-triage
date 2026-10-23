@@ -22,9 +22,14 @@ const Project = z.object({
   id: z.string().regex(/^[a-z0-9-]+$/),
   name: z.string(),
   // Folder inside the vault, for example "Projects/Sweden legal matter".
-  folder: z.string(),
-  // Your own lawyer for this matter. When you are only in cc on mail from the court or the
-  // other side, the suggested reply goes to this person instead.
+  folder: z
+    .string()
+    .min(1)
+    .refine((f) => !f.startsWith("/") && !f.split(/[\\/]/).some((part) => part === ".." || part === "."), {
+      message: 'must be a path inside the vault, such as "Projects/Name", without ".." or a leading "/"',
+    }),
+  // Your own lawyer for this matter. Suggested replies to mail from the court or the other side
+  // go to this person instead of the sender, whether you are in To or only in cc.
   counsel: z
     .object({ name: z.string(), email: z.string(), language: z.enum(LANGUAGES).default("en") })
     .optional(),

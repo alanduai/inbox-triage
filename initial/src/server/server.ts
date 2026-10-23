@@ -36,6 +36,8 @@ function summaryOf(item: Item, projectName: string) {
     replyBy: item.triage?.reply_by ?? "",
     status: item.status,
     onlyCc: item.onlyCc,
+    senderVerified: item.senderVerified,
+    stuck: item.status === "pending_triage" && Date.now() - new Date(item.createdAt).getTime() > 5 * 60_000,
     reviewRequired: item.triage?.review_required ?? false,
     userUrgency: item.userUrgency,
     hasNote: Boolean(item.notePath),
@@ -203,7 +205,9 @@ export function createServer(deps: ServerDeps): http.Server {
           const status = body.status;
           if (status !== "no_reply_needed" && status !== "needs_reply") return send(res, 400, { error: "bad status" });
           if (status === "needs_reply" && OPEN_STATUSES.includes(item.status)) return send(res, 200, { ok: true });
-          deps.pipeline ? deps.pipeline.setStatus(item.id, status, "set in dashboard") : store.setStatus(item.id, status, "set in dashboard");
+          if (deps.pipeline) deps.pipeline.setStatus(item.id, status, "set in dashboard");
+          else if (status === "needs_reply") store.reopen(item.id);
+          else store.setStatus(item.id, status, "set in dashboard");
           return send(res, 200, { ok: true });
         }
 
@@ -217,6 +221,7 @@ export function createServer(deps: ServerDeps): http.Server {
 
         if (req.method === "POST" && parts[3] === "retriage") {
           if (!deps.pipeline) return send(res, 503, { error: "Gmail is not connected in this process" });
+          if (item.status !== "triage_failed" && item.status !== "pending_triage") return send(res, 409, { error: "This item is already triaged" });
           const updated = await deps.pipeline.retriage(item.id);
           return send(res, 200, { ok: Boolean(updated?.triage), error: updated?.triageError ?? "" });
         }

@@ -78,7 +78,11 @@ export async function doctor(cfg: LoadedConfig, opts: { online: boolean }): Prom
     add(
       "Obsidian Sync plugin",
       sync ? "ok" : "warn",
-      sync === null ? "could not read .obsidian/core-plugins.json" : sync ? "turned on for this vault" : "turned off for this vault; notes will stay on the Mac mini",
+      sync === null
+        ? "could not read .obsidian/core-plugins.json; check Settings → Core plugins → Sync in Obsidian"
+        : sync
+          ? "listed as on in .obsidian/core-plugins.json"
+          : "not listed as on in .obsidian/core-plugins.json; check Settings → Core plugins → Sync in Obsidian",
     );
   }
 

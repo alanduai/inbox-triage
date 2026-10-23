@@ -5,7 +5,7 @@
  * where the decimal is the Gmail API's hex id converted to base 10. This only holds for threads
  * whose id is also the id of one of their messages (threads started by someone else). Threads you
  * started use a different web id that the API does not expose, so those links fall back to a
- * search for the message's own Message-ID header, which Gmail resolves to exactly that message.
+ * Gmail search for the message's own Message-ID header: a results view holding only that message.
  */
 
 export function hexToDecimal(hex: string): string {

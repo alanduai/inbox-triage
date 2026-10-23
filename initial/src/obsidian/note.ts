@@ -12,13 +12,33 @@ import type { Triage } from "../triage/claude.js";
 export const APP_KEYS = ["source", "project", "subject", "gmail", "from", "status", "urgency", "reply_by", "due", "review_required", "updated"] as const;
 export type AppKey = (typeof APP_KEYS)[number];
 
+/**
+ * A YAML scalar that Obsidian reads back as the same text. Plain only when it starts with a letter
+ * and cannot be read as a boolean or null (YAML 1.1 included), or when it is a date we wrote.
+ */
 export function yamlValue(value: string | boolean): string {
   if (typeof value === "boolean") return value ? "true" : "false";
   if (value === "") return '""';
-  if (/^[\p{L}\p{N} ._\-–—@+/()&,']+$/u.test(value) && !/^[-?:,\[\]{}#&*!|>'"%@`]/.test(value) && !/^(true|false|null|yes|no|~)$/i.test(value)) {
-    return value;
-  }
-  return JSON.stringify(value);
+  if (/^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2})?$/.test(value)) return value;
+  const plain =
+    /^\p{L}[\p{L}\p{N} ._\-–—@+/()&,']*$/u.test(value) && !/^(y|n|yes|no|true|false|on|off|null)$/i.test(value) && !/\s$/.test(value);
+  return plain ? value : JSON.stringify(value);
+}
+
+/** One line of text: newlines and runs of spaces become one space. */
+export function singleLine(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Makes email text inert in Obsidian: no images or links ([ ]), no HTML (<), no code or Dataview
+ * (`), no tags (#), no comments (%), no escapes (\). It still reads as the same text.
+ */
+export function escapeMd(text: string): string {
+  return text
+    .replace(/\\/g, "\\\\")
+    .replace(/[`\[\]#%]/g, (c) => `\\${c}`)
+    .replace(/</g, "&lt;");
 }
 
 export function blockId(itemId: string): string {
@@ -68,7 +88,7 @@ export function setTaskDone(content: string, itemId: string, done: boolean): str
 
 /** The app's task line for an item: "- [ ] Task 📅 2026-10-26 ^it-<id>". */
 export function taskLine(itemId: string, triage: Triage | null): string {
-  const task = triage?.task || (triage ? "" : "Triage this message by hand");
+  const task = triage ? escapeMd(singleLine(triage.task)) : "Triage this message by hand";
   if (!task) return "";
   const due = triage?.due_date ? ` 📅 ${triage.due_date}` : "";
   const done = triage && !triage.needs_reply ? "x" : " ";
@@ -82,11 +102,35 @@ export function replaceTaskLine(content: string, itemId: string, line: string): 
   return line ? appendSection(content, `${line}\n`) : content;
 }
 
+/** The summary and urgency lines a successful triage adds to a message section. */
+function triageLines(t: Triage): string[] {
+  return [`**Summary:** ${escapeMd(singleLine(t.summary))}`, `**Urgency:** ${t.urgency} (${t.urgency_score}). ${escapeMd(singleLine(t.urgency_reason))}`];
+}
+
+/**
+ * After a retried triage succeeds: swaps the item's "Triage failed" line for the summary and
+ * urgency lines. Only looks inside the item's own section, between its heading and its task line.
+ */
+export function replaceTriageFailed(content: string, itemId: string, triage: Triage): string {
+  const lines = content.split("\n");
+  const taskAt = lines.findIndex((l) => new RegExp(`\\^${blockId(itemId)}\\s*$`).test(l));
+  if (taskAt === -1) return content;
+  for (let i = taskAt - 1; i >= 0 && !(lines[i] ?? "").startsWith("## "); i--) {
+    if ((lines[i] ?? "").startsWith("**Triage failed:**")) {
+      lines.splice(i, 1, ...triageLines(triage));
+      return lines.join("\n");
+    }
+  }
+  return content;
+}
+
 export interface SectionInput {
   itemId: string;
   receivedLocal: string;
   fromName: string;
   fromEmail: string;
+  // Gmail's sender authentication; false is flagged in the note.
+  senderVerified: boolean | null;
   link: string;
   onlyCc: boolean;
   body: string;
@@ -107,26 +151,27 @@ function sizeLabel(bytes: number): string {
 }
 
 export function messageSection(s: SectionInput): string {
-  const flags = [`[Open in Gmail](${s.link})`];
+  const flags = [`[Open in Gmail](<${s.link}>)`];
+  if (s.senderVerified === false) flags.push("**sender not verified by Gmail: check before trusting it**");
   if (s.onlyCc) flags.push("you were in cc");
   if (s.triage?.review_required) flags.push("review required");
-  const lines = [`## ${s.receivedLocal} · ${s.fromName || s.fromEmail}`, flags.join(" · "), "", quote(s.body), ""];
+  const who = escapeMd(singleLine(s.fromName ? `${s.fromName} (${s.fromEmail})` : s.fromEmail));
+  const lines = [`## ${s.receivedLocal} · ${who}`, flags.join(" · "), "", quote(escapeMd(s.body)), ""];
 
   if (s.triage) {
-    lines.push(`**Summary:** ${s.triage.summary}`);
-    lines.push(`**Urgency:** ${s.triage.urgency} (${s.triage.urgency_score}). ${s.triage.urgency_reason}`);
-    lines.push("");
+    lines.push(...triageLines(s.triage), "");
   } else if (s.triageError) {
-    lines.push(`**Triage failed:** ${s.triageError}`, "");
+    lines.push(`**Triage failed:** ${escapeMd(singleLine(s.triageError))}`, "");
   }
 
   if (s.attachments.length) {
     lines.push("**Attachments:**");
     for (const a of s.attachments) {
+      const label = singleLine(a.filename).replace(/[[\]|#^]/g, " ").trim() || "attachment";
       lines.push(
         a.inVault
-          ? `- [[${a.path}|${a.filename}]]`
-          : `- ${a.filename} (${sizeLabel(a.size)}, over the Obsidian Sync file limit; kept on the Mac mini at \`${a.path}\`)`,
+          ? `- [[${a.path}|${label}]]`
+          : `- ${escapeMd(label)} (${sizeLabel(a.size)}, over the Obsidian Sync file limit; kept on the Mac mini at ${escapeMd(a.path)})`,
       );
     }
     lines.push("");
@@ -138,7 +183,7 @@ export function messageSection(s: SectionInput): string {
 }
 
 export function newNote(fm: Partial<Record<AppKey, string | boolean>>, title: string, firstSection: string): string {
-  return `${frontmatter(fm, ["tags: [inbox, gmail]"])}\n# ${title}\n\n${firstSection}`;
+  return `${frontmatter(fm, ["tags: [inbox, gmail]"])}\n# ${escapeMd(singleLine(title))}\n\n${firstSection}`;
 }
 
 export function appendSection(content: string, section: string): string {

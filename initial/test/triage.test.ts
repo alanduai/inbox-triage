@@ -92,6 +92,7 @@ test("the prompt routes court mail to the lawyer and keeps the system prompt sta
     role: "court",
     reviewRequired: true,
     onlyCc: true,
+    senderVerified: true,
     route: { name: "Elin Holm", email: "elin@lawfirm.example", redirected: true, language: "en" },
     replyLanguage: "en",
     signOffs: { en: "Best regards,\nAlan", hr: "Lijep pozdrav,\nAlan", sv: "Med vänlig hälsning,\nAlan" },
