@@ -1,0 +1,58 @@
+{
+  "owner": {
+    "name": "Alan",
+    "emails": ["you@example.com"]
+  },
+  "vault": {
+    "path": "/Users/you/Documents/Obsidian/B",
+    "syncEncryption": "unknown",
+    "maxSyncFileMB": 200
+  },
+  "gmail": {
+    "account": "you@example.com",
+    "pollSeconds": 60,
+    "initialLookbackDays": 3
+  },
+  "claude": {
+    "model": "claude-opus-5-5",
+    "effort": "high",
+    "apiKeySource": "keychain",
+    "keychainService": "inbox-triage-anthropic"
+  },
+  "signOffs": {
+    "en": "Best regards,\nAlan",
+    "hr": "Lijep pozdrav,\nAlan",
+    "sv": "Med vänlig hälsning,\nAlan"
+  },
+  "projects": [
+    {
+      "id": "sweden-legal",
+      "name": "Sweden — legal matter",
+      "folder": "Projects/Sweden legal matter",
+      "counsel": { "name": "Your lawyer", "email": "lawyer@your-law-firm.example", "language": "en" },
+      "contacts": [
+        { "match": "lawyer@your-law-firm.example", "role": "own_lawyer", "alwaysUrgent": true },
+        { "match": "@your-law-firm.example", "role": "own_lawyer" },
+        { "match": "@partner-firm.example", "role": "own_lawyer" },
+        { "match": "@court.example", "role": "court", "reviewRequired": true, "alwaysUrgent": true },
+        { "match": "@other-side-firm.example", "role": "opposing_counsel", "reviewRequired": true }
+      ]
+    },
+    {
+      "id": "croatia-bank",
+      "name": "Croatia — bank & advisors",
+      "folder": "Projects/Croatia bank and advisors",
+      "contacts": [
+        { "match": "contact@bank.example", "role": "bank", "alwaysUrgent": true },
+        { "match": "@bank.example", "role": "bank" },
+        { "match": "@advisor-one.example", "role": "advisor" },
+        { "match": "@advisor-two.example", "role": "advisor" }
+      ]
+    }
+  ],
+  "dashboard": {
+    "host": "127.0.0.1",
+    "port": 8787
+  },
+  "dataDir": "data"
+}
