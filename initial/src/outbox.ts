@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { LoadedConfig } from "./config.js";
 import type { GmailReader } from "./gmail/client.js";
-import { isNotFound } from "./gmail/errors.js";
+import { GMAIL_TIMEOUT_MS, isNotFound } from "./gmail/errors.js";
 import { buildReply, toRaw, withQuote, type MailAddress } from "./gmail/mime.js";
 import type { GmailSender } from "./gmail/sender.js";
 import type { ParsedMessage } from "./gmail/parse.js";
@@ -14,8 +14,10 @@ import { log } from "./util/time.js";
 // A send still queued this long after its Undo window ended (the service was stopped, or the Mac
 // slept) is not sent late on its own: it waits for you to press Retry.
 const STALE_MS = 10 * 60_000;
-// A send whose Gmail call started this long ago, with no answer recorded, is checked in Gmail.
-const UNCERTAIN_MS = 60_000;
+// A send handed to Gmail this long ago, with no answer recorded, is looked up in Gmail. Well over
+// the send call's own time limit, so no call of it can still be running anywhere.
+const UNCERTAIN_MS = 3 * GMAIL_TIMEOUT_MS;
+const GONE = "Outcome unknown: Gmail may have sent it, but the thread was deleted in Gmail before that could be checked. Look in your Sent folder.";
 
 export class OutboxError extends Error {}
 
@@ -128,6 +130,10 @@ export class Outbox {
       // Read before sending: Message-ID and References keep the reply in the thread.
       const original = await reader.message(item.id);
       const raw = toRaw(this.message(item, original, e));
+      if (!store.outboxHanding(e.id, attempt)) {
+        log(`send ${e.id} was settled elsewhere while its message was read; not sending it`);
+        return;
+      }
       handedToGmail = true;
       const gmailId = await sender.send(raw, item.threadId);
       store.outboxSent(e.id, gmailId);
@@ -142,7 +148,7 @@ export class Outbox {
           if (found) store.outboxSent(e.id, found);
           else store.outboxFailed(e.id, `Not sent: ${message}`, attempt);
         } catch (checkErr) {
-          if (isNotFound(checkErr)) store.outboxFailed(e.id, "Not sent: the thread was deleted in Gmail.", attempt);
+          if (isNotFound(checkErr)) store.outboxUnknown(e.id, GONE, attempt);
           // Outcome unknown: it stays "sending" and is checked again in a minute.
           else store.outboxNote(e.id, `Checking whether it went out: ${checkErr instanceof Error ? checkErr.message : String(checkErr)}`);
         }
@@ -172,7 +178,7 @@ export class Outbox {
           await this.finish(store.outboxGet(e.id)!);
         } else store.outboxFailed(e.id, `Not sent${e.error ? ` (${e.error})` : ""}. Press Retry to send it.`, e.attempt);
       } catch (err) {
-        if (isNotFound(err)) store.outboxFailed(e.id, "Not sent: the thread was deleted in Gmail.", e.attempt);
+        if (isNotFound(err)) store.outboxUnknown(e.id, GONE, e.attempt);
         else store.outboxNote(e.id, `Checking whether it went out: ${err instanceof Error ? err.message : String(err)}`);
       }
     }

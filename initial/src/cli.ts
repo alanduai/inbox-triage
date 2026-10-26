@@ -107,9 +107,27 @@ async function main(argv: string[]): Promise<number> {
   }
 }
 
+// A copy of the service that has not renewed its lease for this long is taken to be gone.
+const LEASE_STALE_MS = 2 * 60_000;
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 async function runService(): Promise<number> {
   const cfg = loadConfig();
   const store = openStore(cfg);
+  // One copy per data folder, whatever its port: a second copy stops before touching anything.
+  const lease = store.acquireLease(process.pid, LEASE_STALE_MS, processAlive);
+  if (!lease.ok) {
+    store.close();
+    throw new Error(`Another copy of the service is running (process ${lease.holder}). Stop it first, or wait two minutes if it was killed.`);
+  }
   let pipeline: Pipeline | null = null;
   let outbox: Outbox | null = null;
   let lastPoll: { at: string; ok: boolean; message: string } | null = null;
@@ -162,7 +180,17 @@ async function runService(): Promise<number> {
   let sending: Promise<unknown> = Promise.resolve();
   let sendBusy = false;
   let lastMaintain = 0;
+  let leaseRenewed = 0;
   const sendTimer = setInterval(() => {
+    if (Date.now() - leaseRenewed > 20_000) {
+      leaseRenewed = Date.now();
+      if (!store.renewLease(process.pid)) {
+        // Another copy took over (this one was stalled for minutes): stop sending and exit.
+        log("another copy of the service took over; stopping");
+        process.kill(process.pid, "SIGTERM");
+        return;
+      }
+    }
     if (!outbox || stopping || sendBusy) return;
     sendBusy = true;
     const maintain = Date.now() - lastMaintain > 30_000;
@@ -184,6 +212,7 @@ async function runService(): Promise<number> {
     process.once("SIGTERM", stop);
     process.once("SIGINT", stop);
   });
+  store.releaseLease(process.pid);
   store.close();
   return 0;
 }

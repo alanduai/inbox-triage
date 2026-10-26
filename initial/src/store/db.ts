@@ -7,6 +7,8 @@ import type { Urgency } from "../triage/schema.js";
 
 // Open: pending_triage, needs_reply, needs_action (a task without a reply), triage_failed.
 // Closed: replied, no_reply_needed, done (a needs_action task you finished).
+const LEASE_KEY = "service.lease";
+
 export const STATUSES = ["pending_triage", "needs_reply", "needs_action", "triage_failed", "replied", "no_reply_needed", "done"] as const;
 export type Status = (typeof STATUSES)[number];
 export const OPEN_STATUSES: Status[] = ["pending_triage", "needs_reply", "needs_action", "triage_failed"];
@@ -187,7 +189,8 @@ function toItem(r: Row): Item {
 
 // queued: waiting out the Undo window. sending: handed to Gmail, outcome not yet recorded.
 // sent, failed (shown with Retry) and cancelled (undone) are final until you press Retry.
-export const OUTBOX_STATES = ["queued", "sending", "sent", "failed", "cancelled"] as const;
+// unknown: Gmail may have sent it, but its thread was deleted before that could be checked; final.
+export const OUTBOX_STATES = ["queued", "sending", "sent", "failed", "cancelled", "unknown"] as const;
 export type OutboxState = (typeof OUTBOX_STATES)[number];
 
 // What has happened after a send: the item's status, the note in Obsidian, the archive in Gmail.
@@ -477,6 +480,42 @@ export class Store {
     ).map(toItem);
   }
 
+  /**
+   * The service lease: one copy of the service per data folder runs the outbox and the polls. A
+   * lease is held by a live process that renewed it within staleMs; anything else is taken over,
+   * so a reboot (when old process numbers mean nothing) never locks the service out for long.
+   */
+  acquireLease(pid: number, staleMs: number, isAlive: (pid: number) => boolean): { ok: true } | { ok: false; holder: number } {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const raw = this.getState(LEASE_KEY);
+      const held = raw ? (JSON.parse(raw) as { pid: number; at: string }) : null;
+      if (held && held.pid !== pid && Date.now() - new Date(held.at).getTime() < staleMs && isAlive(held.pid)) {
+        this.db.exec("ROLLBACK");
+        return { ok: false, holder: held.pid };
+      }
+      this.setState(LEASE_KEY, JSON.stringify({ pid, at: new Date().toISOString() }));
+      this.db.exec("COMMIT");
+      return { ok: true };
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  /** Renews the lease; false when another process has taken it over. */
+  renewLease(pid: number): boolean {
+    const raw = this.getState(LEASE_KEY);
+    if (raw && (JSON.parse(raw) as { pid: number }).pid !== pid) return false;
+    this.setState(LEASE_KEY, JSON.stringify({ pid, at: new Date().toISOString() }));
+    return true;
+  }
+
+  releaseLease(pid: number): void {
+    const raw = this.getState(LEASE_KEY);
+    if (raw && (JSON.parse(raw) as { pid: number }).pid === pid) this.db.prepare("DELETE FROM state WHERE key = ?").run(LEASE_KEY);
+  }
+
   getState(key: string): string | null {
     const row = this.db.prepare("SELECT value FROM state WHERE key = ?").get(key) as Row | undefined;
     return row ? String(row.value) : null;
@@ -554,6 +593,22 @@ export class Store {
     const r = this.db.prepare("UPDATE outbox SET state = 'failed', error = ? WHERE id = ? AND state = 'sending' AND attempt = ?").run(error, id, attempt);
     const e = this.outboxGet(id);
     if (Number(r.changes) && e) this.log(e.itemId, "send_failed", `${id}: ${error}`);
+  }
+
+  /**
+   * The moment the message is handed to Gmail, where uncertainty about whether it went out starts.
+   * False when this attempt no longer owns the send (settled elsewhere meanwhile): then it is not sent.
+   */
+  outboxHanding(id: string, attempt: number): boolean {
+    const r = this.db.prepare("UPDATE outbox SET attempt_at = ? WHERE id = ? AND state = 'sending' AND attempt = ?").run(new Date().toISOString(), id, attempt);
+    return Number(r.changes) === 1;
+  }
+
+  /** Gmail may have sent it, but the thread is gone, so it can never be checked. Not retried. */
+  outboxUnknown(id: string, error: string, attempt: number): void {
+    const r = this.db.prepare("UPDATE outbox SET state = 'unknown', error = ? WHERE id = ? AND state = 'sending' AND attempt = ?").run(error, id, attempt);
+    const e = this.outboxGet(id);
+    if (Number(r.changes) && e) this.log(e.itemId, "send_unknown", `${id}: ${error}`);
   }
 
   /** A queued send whose time passed long ago (the service was stopped, or the Mac slept): not sent late. */

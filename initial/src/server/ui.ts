@@ -398,6 +398,7 @@ dialog.confirm p { margin: 4px 0; overflow-wrap: anywhere; }
     var r = el("div", "row");
     if (e.state === "queued" || e.state === "sending") r.appendChild(el("span", "chip warn", "Sending…"));
     else if (e.state === "sent") r.appendChild(el("span", "chip ok", (e.kind === "ack" ? "Acknowledgement sent " : "Sent ") + when(e.sentAt)));
+    else if (e.state === "unknown") { r.appendChild(el("span", "chip warn", "Outcome unknown")); r.appendChild(el("span", "muted", e.error)); }
     else { r.appendChild(el("span", "chip bad", "Not sent")); r.appendChild(el("span", "muted", e.error)); r.appendChild(btn("Retry", "", function () { retrySend(e.id, d.id); })); }
     box.appendChild(r);
   }
@@ -442,7 +443,7 @@ dialog.confirm p { margin: 4px 0; overflow-wrap: anywhere; }
     api("GET", "/api/outbox/" + id).then(function (e) {
       if ((e.state === "queued" || e.state === "sending") && n < 40) { setTimeout(function () { watchSend(id, itemId, n + 1); }, 750); return; }
       toast(e.state === "sent" ? (e.kind === "ack" ? "Acknowledgement sent. The message stays in your queue for the real reply." : "Sent. Marked read and archived in Gmail.")
-        : e.state === "failed" ? "Not sent: " + e.error : "Still sending. Check again in a moment.");
+        : e.state === "failed" ? e.error : e.state === "unknown" ? e.error : "Still sending. Check again in a moment.");
       refresh(); if (S.sel === itemId) loadDetail(itemId);
     }).catch(function (err) { toast(err.message); });
   }

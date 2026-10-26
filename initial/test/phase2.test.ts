@@ -363,10 +363,13 @@ function harness(cfgOverrides: Record<string, unknown> = {}) {
   const msgs = new Map<string, ParsedMessage>();
   const meta: Meta[] = [];
   const gone = new Set<string>();
+  // Holds reading a message until released, as a slow Gmail would.
+  const readHold: { p: Promise<void> | null } = { p: null };
   const gmail = {
     listIds: async () => ({ ids: [...msgs.keys()], truncated: false }),
     message: async (id: string) => {
       if (gone.has(id)) throw Object.assign(new Error("Requested entity was not found."), { status: 404 });
+      if (readHold.p) await readHold.p;
       return msgs.get(id)!;
     },
     thread: async (id: string) => [...msgs.values()].filter((m) => m.threadId === id),
@@ -385,7 +388,7 @@ function harness(cfgOverrides: Record<string, unknown> = {}) {
   const sender = new FakeSender((m) => meta.push(m));
   const outbox = new Outbox({ cfg, store, reader: gmail as unknown as GmailReader, sender: sender as unknown as GmailSender, notes: pipeline.notes });
   return {
-    cfg, store, pipeline, sender, outbox, vault, answers, meta, gone, gmail,
+    cfg, store, pipeline, sender, outbox, vault, answers, meta, gone, gmail, readHold,
     add: (m: ParsedMessage) => msgs.set(m.id, m),
     note: (rel: string) => fs.readFileSync(path.join(vaultDir, rel), "utf8"),
     /** Ends the Undo window of every queued send now. */
@@ -489,7 +492,7 @@ test("outbox: when even the lookup fails, the send stays unknown and is settled 
   assert.equal(h.store.outboxGet(e.id)!.state, "sending");
   await h.outbox.maintain();
   assert.equal(h.store.outboxGet(e.id)!.state, "sending", "checked again only after a minute");
-  h.store.db.prepare("UPDATE outbox SET attempt_at = ? WHERE id = ?").run(new Date(Date.now() - 120_000).toISOString(), e.id);
+  h.store.db.prepare("UPDATE outbox SET attempt_at = ? WHERE id = ?").run(new Date(Date.now() - 10 * 60_000).toISOString(), e.id);
   await h.outbox.maintain();
   assert.equal(h.store.outboxGet(e.id)!.state, "sent");
   assert.equal(h.sender.sent.length, 1);
@@ -504,8 +507,8 @@ test("outbox: after a restart, a send left long in the queue waits for Retry, an
   const stale = h.outbox.queue(h.store.get("1a")!, "reply", ["marija@bank.example"], [], "Hvala.");
   h.store.db.prepare("UPDATE outbox SET send_at = ? WHERE id = ?").run(new Date(Date.now() - 20 * 60_000).toISOString(), stale.id);
   const cut = h.outbox.queue(h.store.get("1b")!, "reply", ["ivan@bank.example"], [], "Hvala.");
-  // Cut off by the stop two minutes ago, so no call of it can still be running.
-  h.store.db.prepare("UPDATE outbox SET state = 'sending', attempt = 1, attempt_at = ? WHERE id = ?").run(new Date(Date.now() - 120_000).toISOString(), cut.id);
+  // Cut off by the stop ten minutes ago, so no call of it can still be running.
+  h.store.db.prepare("UPDATE outbox SET state = 'sending', attempt = 1, attempt_at = ? WHERE id = ?").run(new Date(Date.now() - 10 * 60_000).toISOString(), cut.id);
   const restarted = new Outbox({ cfg: h.cfg, store: h.store, reader: (h.outbox as unknown as { deps: { reader: GmailReader } }).deps.reader, sender: h.sender as unknown as GmailSender, notes: h.pipeline.notes });
   await restarted.recover();
   await restarted.tick();
@@ -669,7 +672,7 @@ test("SM-1: a second copy settling a send that is still in flight never causes a
   await b.recover();
   assert.equal(h.store.outboxGet(e.id)!.state, "sending", "a fresh call is not looked up by another copy");
   // Even if the other copy decides it failed (the call is slow) and you press Retry...
-  h.store.db.prepare("UPDATE outbox SET attempt_at = ? WHERE id = ?").run(new Date(Date.now() - 120_000).toISOString(), e.id);
+  h.store.db.prepare("UPDATE outbox SET attempt_at = ? WHERE id = ?").run(new Date(Date.now() - 10 * 60_000).toISOString(), e.id);
   await b.maintain();
   assert.equal(h.store.outboxGet(e.id)!.state, "failed");
   await b.retry(e.id);
@@ -730,7 +733,7 @@ test("SM-4: a reply confirmed late never closes a message you put back in the qu
   assert.equal(h.store.get("1a")!.status, "replied", "the poll sees your reply in Gmail");
   await sleep(5);
   h.pipeline.setStatus("1a", "needs_reply", "set in dashboard");
-  h.store.db.prepare("UPDATE outbox SET attempt_at = ? WHERE id = ?").run(new Date(Date.now() - 120_000).toISOString(), e.id);
+  h.store.db.prepare("UPDATE outbox SET attempt_at = ? WHERE id = ?").run(new Date(Date.now() - 10 * 60_000).toISOString(), e.id);
   // Keep the original press time: the reopen came after it.
   await h.outbox.maintain();
   assert.equal(h.store.outboxGet(e.id)!.state, "sent");
@@ -787,4 +790,70 @@ test("SM-8: a send long overdue after the Mac slept is not sent late, without an
   assert.equal(h.sender.sent.length, 0);
   assert.equal(h.store.outboxGet(e.id)!.state, "failed");
   assert.match(h.store.outboxGet(e.id)!.error, /Press Retry/);
+});
+
+// ---------- re-test findings ----------
+
+test("R7: a send settled by another copy while its message was being read is not sent at all", async () => {
+  const h = harness();
+  h.add(msg({ id: "1a", thread: "t1", from: "Marija <marija@bank.example>", at: T0 }));
+  await h.pipeline.pollOnce();
+  const e = h.outbox.queue(h.store.get("1a")!, "reply", ["marija@bank.example"], [], "Hvala.");
+  let release!: () => void;
+  h.readHold.p = new Promise<void>((r) => (release = r));
+  h.due();
+  const a = h.outbox.tick();
+  await sleep(5);
+  // The read is very slow: another copy finds nothing in Gmail, marks it failed, and you retry.
+  h.store.db.prepare("UPDATE outbox SET attempt_at = ? WHERE id = ?").run(new Date(Date.now() - 10 * 60_000).toISOString(), e.id);
+  const b = new Outbox({ cfg: h.cfg, store: h.store, reader: h.gmail as unknown as GmailReader, sender: h.sender as unknown as GmailSender, notes: h.pipeline.notes });
+  await b.maintain();
+  assert.equal(h.store.outboxGet(e.id)!.state, "failed");
+  await b.retry(e.id);
+  h.readHold.p = null;
+  release();
+  await a;
+  assert.equal(h.sender.sent.length, 0, "the first copy no longer owns it, so it does not send");
+  h.due();
+  await b.tick();
+  assert.equal(h.sender.sent.length, 1);
+});
+
+test("R10: a send whose thread was deleted before it could be checked is 'outcome unknown', with no Retry", async () => {
+  const h = harness();
+  h.add(msg({ id: "1a", thread: "t1", from: "Marija <marija@bank.example>", at: T0 }));
+  await h.pipeline.pollOnce();
+  const e = h.outbox.queue(h.store.get("1a")!, "reply", ["marija@bank.example"], [], "Hvala.");
+  h.sender.failSend = "after";
+  h.sender.failFind = 1;
+  h.due();
+  await h.outbox.tick();
+  assert.equal(h.store.outboxGet(e.id)!.state, "sending");
+  // The thread is deleted for good before the next check.
+  h.sender.findSent = async () => {
+    throw Object.assign(new Error("Not Found"), { status: 404 });
+  };
+  h.store.db.prepare("UPDATE outbox SET attempt_at = ? WHERE id = ?").run(new Date(Date.now() - 10 * 60_000).toISOString(), e.id);
+  await h.outbox.maintain();
+  const u = h.store.outboxGet(e.id)!;
+  assert.equal(u.state, "unknown");
+  assert.match(u.error, /may have sent it/);
+  await assert.rejects(h.outbox.retry(e.id), OutboxError);
+  assert.ok(h.outbox.queue(h.store.get("1a")!, "reply", ["marija@bank.example"], [], "Hvala."), "a new reply can still be written");
+});
+
+test("the service lease: one live copy per data folder; a stale or dead holder is taken over", () => {
+  const store = new Store(":memory:");
+  const alive = new Set([111, 222]);
+  const isAlive = (pid: number) => alive.has(pid);
+  assert.deepEqual(store.acquireLease(111, 120_000, isAlive), { ok: true });
+  assert.deepEqual(store.acquireLease(222, 120_000, isAlive), { ok: false, holder: 111 });
+  alive.delete(111);
+  assert.deepEqual(store.acquireLease(222, 120_000, isAlive), { ok: true }, "the holder died");
+  assert.equal(store.renewLease(111), false, "a copy that lost the lease learns it");
+  alive.add(111);
+  store.db.prepare("UPDATE state SET value = ? WHERE key = 'service.lease'").run(JSON.stringify({ pid: 222, at: new Date(Date.now() - 5 * 60_000).toISOString() }));
+  assert.deepEqual(store.acquireLease(111, 120_000, isAlive), { ok: true }, "not renewed for minutes: taken over, e.g. after a reboot");
+  store.releaseLease(111);
+  assert.equal(store.getState("service.lease"), null);
 });

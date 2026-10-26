@@ -63,8 +63,8 @@ Each message shows its reply with **To** and **Cc** filled in, ready to edit.
 - **A send that fails** is shown as **Not sent**, with the reason and a **Retry** button. It is never sent again on its own. Retry gives you a fresh Undo window.
 - **A send whose outcome is unknown** (the connection dropped as Gmail took it) is looked up in the thread by its own reference before it is ever called failed, so it is not sent twice. If Gmail confirms it later, it counts as sent, whatever happened meanwhile.
 - **A send more than 10 minutes overdue** (the service was stopped, or the Mac slept) is not sent late on its own: it waits for Retry.
-- **A message deleted in Gmail** before its reply went out: the send fails at once, with the reason.
-- **Only one copy of the service sends.** A second copy started by mistake stops before it touches anything, because the dashboard's port is taken.
+- **A message deleted in Gmail** before its reply went out: the send fails at once, with the reason. If the thread was deleted while a send's outcome was still being checked, it shows **Outcome unknown**: look in your Sent folder. No Retry is offered, so it can never go twice.
+- **Only one copy of the service runs.** A second copy started by mistake, even on another port, stops before it touches anything. A copy that was killed is taken over after two minutes.
 - **Every Gmail call gives up after a minute**, so one that hangs never stops the others.
 
 ### The notes
