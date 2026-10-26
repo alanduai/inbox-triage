@@ -241,6 +241,23 @@ export function messageSection(s: SectionInput): string {
   return lines.join("\n");
 }
 
+/** Block id of the app's line for a reply sent from the dashboard. */
+export function sentBlockId(outboxId: string): string {
+  return `out-${outboxId.replace(/[^a-zA-Z0-9-]/g, "")}`;
+}
+
+/** What you sent from the dashboard, in the thread's note: who it went to, then your text quoted. */
+export function sentSection(s: { outboxId: string; sentLocal: string; kind: "reply" | "ack"; to: string[]; cc: string[]; body: string }): string {
+  const who = [`To: ${s.to.join(", ")}`, ...(s.cc.length ? [`Cc: ${s.cc.join(", ")}`] : [])].join(" · ");
+  return [
+    `## ${s.sentLocal} · ${s.kind === "ack" ? "You acknowledged" : "You replied"}`,
+    `${escapeMd(singleLine(who))} ^${sentBlockId(s.outboxId)}`,
+    "",
+    quote(escapeMd(s.body)),
+    "",
+  ].join("\n");
+}
+
 export function newNote(fm: Partial<Record<AppKey, string | boolean>>, title: string, firstSection: string): string {
   return `${frontmatter(fm, ["tags: [inbox, gmail]"])}\n# ${escapeMd(singleLine(title))}\n\n${firstSection}`;
 }

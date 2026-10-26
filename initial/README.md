@@ -1,13 +1,13 @@
-# inbox-triage: phase 1
+# inbox-triage: phases 1 and 2
 
-Reads new Gmail from the people in your two private matters, triages each message with Claude, files it into your Obsidian vault, and shows a dashboard with a suggested reply you can edit. It runs on the Mac mini.
+Reads new Gmail from the people in your two private matters, triages each message with Claude, files it into your Obsidian vault, and shows a dashboard with a suggested reply you can edit and send. It runs on the Mac mini.
 
-**Phase 1 sends nothing.** Gmail access is read-only. To answer, copy the reply from the dashboard and send it from Gmail or Superhuman. The item closes on its own once your sent reply to the sender (or to your lawyer, for court mail) shows up in Gmail. A draft you are still writing, or a forward to someone else, does not close it.
+**Sending is off until you turn it on.** Until then, copy a reply or save it as a Gmail draft, and send it from Gmail or Superhuman. An item closes on its own once your sent reply to the sender (or to your lawyer, for court mail) shows up in Gmail. A draft you are still writing, or a forward to someone else, does not close it.
 
 | Phase | Adds |
 |---|---|
-| 1 (this) | Gmail read-only, triage, Obsidian notes and attachments, dashboard, setup checks |
-| 2 | Send reply and acknowledgement from the dashboard, five-second Undo, double confirmation for the court and the other side, mark read and archive in Gmail |
+| 1 | Gmail reading, triage, Obsidian notes and attachments, dashboard, setup checks |
+| 2 (this) | Send a reply or an acknowledgement from the dashboard, with Undo; a second confirmation for the court, the other side and anyone new; Save as Gmail draft; mark read and archive in Gmail after sending |
 | 3 | WhatsApp reading through a linked device (one-to-one chats plus the data center and Hydra zone groups) |
 | 4 | WhatsApp sending |
 
@@ -30,6 +30,42 @@ Reads new Gmail from the people in your two private matters, triages each messag
    - A message that needs a reply shows as **Needs reply**. One that needs something done but no reply (for example, upload documents to a portal) shows as **Action needed**; press **Mark done** when it's finished.
    - Rate each urgent item's urgency: **Yes**, or the level it should have been. Your rating replaces Claude's in the queue and in the note.
    - The phase 1 measure is the share of rated urgent flags you agreed with; unrated items don't count. The target is 90% or more.
+7. You answer from the dashboard (see [Sending](#sending)), or from Gmail or Superhuman.
+
+## Sending
+
+Each message shows its reply with **To** and **Cc** filled in, ready to edit.
+
+**Who it goes to.** Replies go to everyone by default, as Reply all in Gmail: the sender (or their Reply-To on the same domain) and the original To in **To**, the original Cc in **Cc**, never your own addresses. Mail from the court or the other side is the exception: the reply goes to your own lawyer alone, with the court's letter quoted, because Reply all would copy the court and the other side.
+
+**What you can do:**
+- **Send.** The reply goes into the same Gmail thread from your Gmail address, with the original quoted below your text. The quote is introduced by the sender's address, never their display name, which anyone can set.
+  - For the configured number of seconds (5 by default) an **Undo** bar shows; Undo means nothing was sent.
+  - Afterwards the item is **Replied**, and your reply is added to the thread's note ("You replied").
+  - The message you answered, and older ones in the thread, are marked read and archived in Gmail. Superhuman follows Gmail. Anything that arrived in the thread after it stays unread in your inbox.
+- **Send acknowledgement.** Sends Claude's short holding reply, sign-off included. The message stays in your queue, marked **Acknowledged**, until the real reply goes out. It is not offered for the court, the other side or an unverified sender.
+- **Save as Gmail draft.** Puts the reply in the thread as a draft, to finish in Gmail or Superhuman. Nothing is sent; the item closes once you send it from there.
+- **Copy reply**, as in phase 1.
+
+**Checks the server makes before anything goes, whatever the page does:**
+- A reply that still has `[brackets]` (a fact only you know) or is empty is not sent.
+- **A second confirmation**, showing every recipient, when:
+  - the message is marked review required (the court, the other side, an unverified sender);
+  - any recipient is the court or the other side's lawyer;
+  - you added someone who was not on the original message and is not a contact of this matter.
+
+  The confirmation covers exactly what you saw: change a word or a recipient and it asks again.
+- One send per message at a time.
+
+**A reply answers what was there when you pressed Send.** A message that arrives in the thread during the Undo window stays open in the dashboard and unread in your inbox.
+
+**If something goes wrong:**
+- **A send that fails** is shown as **Not sent**, with the reason and a **Retry** button. It is never sent again on its own. Retry gives you a fresh Undo window.
+- **A send whose outcome is unknown** (the connection dropped as Gmail took it) is looked up in the thread by its own reference before it is ever called failed, so it is not sent twice. If Gmail confirms it later, it counts as sent, whatever happened meanwhile.
+- **A send more than 10 minutes overdue** (the service was stopped, or the Mac slept) is not sent late on its own: it waits for Retry.
+- **A message deleted in Gmail** before its reply went out: the send fails at once, with the reason. If the thread was deleted while a send's outcome was still being checked, it shows **Outcome unknown**: look in your Sent folder. No Retry is offered, so it can never go twice.
+- **Only one copy of the service runs.** A second copy started by mistake, even on another port, stops before it touches anything. A copy that was killed is taken over after two minutes.
+- **Every Gmail call gives up after a minute**, so one that hangs never stops the others.
 
 ### The notes
 
@@ -74,7 +110,7 @@ npm run init          # creates config.json and the private data/ folder
 1. In [Google Cloud Console](https://console.cloud.google.com/), create a project and enable the **Gmail API**.
 2. Under **OAuth consent screen**, choose **Internal**. Your address is on a Google Workspace domain, and an Internal app needs no Google review and keeps working. An External app left in "Testing" loses access every 7 days.
 3. Under **Credentials**, create an **OAuth client ID** of type **Desktop app**. Download the JSON file and save it as `data/google-oauth-client.json`.
-4. On the Mac mini itself, run `npm run auth` and sign in. The app asks for read-only Gmail access.
+4. On the Mac mini itself, run `npm run auth` and sign in. The app asks for the `gmail.modify` permission: read, send, save drafts, mark read and archive. It cannot delete mail for good. If you signed in during phase 1 (read-only), run it again; reading keeps working until you do.
 
 ### 3. Give the app your Anthropic API key
 
@@ -96,6 +132,7 @@ The check covers the following, and saves the report so the dashboard can show i
 - that Obsidian is running and starts at login;
 - FileVault, and whether the Mac mini sleeps;
 - the Gmail sign-in and the Claude API key;
+- whether sending is on, and whether the sign-in allows it;
 - that the private data folder is not readable by others.
 
 Fix anything marked ✗ first.
@@ -116,6 +153,20 @@ deploy/uninstall-launchd.sh    # to remove it
 
 Keep Obsidian open on the Mac mini: add it under **System Settings → General → Login Items**. Notes only reach your other devices while Obsidian runs.
 
+### 6. Turn on sending
+
+```sh
+npm run send-test     # two messages to yourself, then archived
+```
+
+The test checks, on your real account:
+- that a reply stays in its thread;
+- that the reply's reference header survives, so a retry can tell whether a send already went out (it is a random value under a neutral name: recipients cannot tell how the reply was written);
+- that a subject with č, ć, š, ž, đ, å, ä and ö comes back intact;
+- that mark read and archive work.
+
+If every line shows ✓, set `"sending": { "enabled": true }` in `config.json` and restart the service. `"undoSeconds"` sets the Undo window (3 to 60 seconds, default 5). If a line shows ✗, keep sending off.
+
 ### Opening the dashboard from your laptop (optional)
 
 By default the dashboard only answers on the Mac mini itself. To reach it from your home network:
@@ -128,6 +179,7 @@ The connection is plain HTTP inside your home network. Don't forward the port on
 ## Privacy and safety
 
 - **Sent to Claude:** the text of in-scope messages, up to six earlier messages in each thread, and the senders' names and addresses. Attachments are not sent; only their names and sizes are.
+- **Sending:** only you send, by pressing Send in the dashboard; Claude never sends anything. The rules above run on the server, so a page or a link cannot skip them. The dashboard answers only on the Mac mini unless you give it a token.
 - **Messages are treated as untrusted data.** The model that reads them has no tools. It is told never to follow instructions inside a message, and requests to change bank details or move money are flagged as possible fraud. The sender's display name is never placed among the trusted facts in the prompt.
 - **Notes are inert.** Email text is escaped before it goes into a note, so a message cannot load images, run code or add tags in Obsidian.
 - **Stored on the Mac mini:** the message store, Gmail token and logs are in `data/`, readable only by you.
@@ -151,4 +203,5 @@ The code is in `src/`:
 - `server/`: dashboard
 - `notes.ts`: keeps each thread's note in line with the store
 - `pipeline.ts`: ties the pieces together
+- `sending.ts`, `outbox.ts`, `gmail/mime.ts`, `gmail/sender.ts`: the send checks, the outbox with Undo, the message format and the Gmail calls that change something
 - `doctor.ts`: setup checks

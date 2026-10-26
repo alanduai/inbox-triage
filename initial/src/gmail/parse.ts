@@ -1,4 +1,5 @@
 import type { gmail_v1 } from "@googleapis/gmail";
+import { headerText } from "../util/text.js";
 
 type Part = gmail_v1.Schema$MessagePart;
 
@@ -28,6 +29,8 @@ export interface ParsedMessage {
   replyTo: Address[];
   subject: string;
   rfc822MessageId: string;
+  // The original References header, carried into replies so every client keeps the thread together.
+  references: string;
   // Full text of the message, and the text without quoted earlier messages.
   text: string;
   latestText: string;
@@ -46,6 +49,11 @@ export interface DeferredPart {
   mimeType: string;
   attachmentId: string;
   charset?: string;
+}
+
+/** The <...> message ids in a header, printable ASCII only; anything else is dropped. */
+export function messageIds(value: string): string[] {
+  return value.match(/<[\x21-\x3b\x3d\x3f-\x7e]+>/g) ?? [];
 }
 
 /** A header's first value, with encoded words decoded unless raw is asked for. */
@@ -172,7 +180,7 @@ export function parseAddressList(value: string): Address[] {
     if (span) {
       const email = s.slice(span[0] + 1, span[1]).trim().toLowerCase();
       const name = (s.slice(0, span[0]) + s.slice(span[1] + 1)).trim().replace(/^"|"$/g, "").replace(/\\(.)/g, "$1").trim();
-      if (ADDR_SPEC.test(email)) out.push({ name: decodeEncodedWords(name), email });
+      if (ADDR_SPEC.test(email)) out.push({ name: headerText(decodeEncodedWords(name)), email });
       return;
     }
     const bare = s.replace(/"[^"]*"/g, " ").match(ADDR_SPEC)?.[0];
@@ -387,8 +395,14 @@ export function parseMessage(msg: gmail_v1.Schema$Message): ParsedMessage {
     to: parseAddressList(header(headers, "To", true)),
     cc: parseAddressList(header(headers, "Cc", true)),
     replyTo: parseAddressList(header(headers, "Reply-To", true)),
-    subject: header(headers, "Subject") || "(no subject)",
-    rfc822MessageId: header(headers, "Message-ID"),
+    subject: headerText(header(headers, "Subject"), 500) || "(no subject)",
+    // Raw, never decoded: a message id is ASCII, and only <...> tokens are kept.
+    rfc822MessageId: messageIds(header(headers, "Message-ID", true))[0] ?? "",
+    // The parent's References, or its In-Reply-To when it has none (RFC 5322 §3.6.4).
+    references: (messageIds(header(headers, "References", true)).length
+      ? messageIds(header(headers, "References", true))
+      : messageIds(header(headers, "In-Reply-To", true)).slice(0, 1)
+    ).join(" "),
     text,
     latestText: stripQuoted(text, header(headers, "Subject")),
     attachments,

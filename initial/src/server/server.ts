@@ -3,7 +3,10 @@ import fs from "node:fs";
 import http from "node:http";
 import { dataPath, isLoopback, type LoadedConfig } from "../config.js";
 import { ThreadNotes } from "../notes.js";
+import { OutboxError, type Outbox } from "../outbox.js";
 import type { Pipeline } from "../pipeline.js";
+import { replyRecipients } from "../scope.js";
+import { checkSend, confirmToken, type SendRequest } from "../sending.js";
 import { OPEN_STATUSES, type Item, type Store } from "../store/db.js";
 import { URGENCIES, type Urgency } from "../triage/schema.js";
 import type { VaultWriter } from "../obsidian/writer.js";
@@ -22,6 +25,14 @@ export interface ServerDeps {
   pipeline: Pipeline | null;
   vault: VaultWriter;
   lastPoll: () => { at: string; ok: boolean; message: string } | null;
+  // Present when Gmail is connected with permission to send (gmail.modify).
+  outbox?: Outbox | null;
+}
+
+function stringList(v: unknown, field: string): string[] {
+  if (v === undefined) return [];
+  if (!Array.isArray(v) || !v.every((x) => typeof x === "string")) throw new BadRequest(`${field} must be a list of addresses`);
+  return v as string[];
 }
 
 function summaryOf(item: Item, projectName: string) {
@@ -48,6 +59,7 @@ function summaryOf(item: Item, projectName: string) {
     reviewRequired: item.triage?.review_required ?? false,
     userUrgency: item.userUrgency,
     hasNote: Boolean(item.notePath),
+    ackedAt: item.ackedAt ?? null,
   };
 }
 
@@ -104,6 +116,10 @@ export function createServer(deps: ServerDeps): http.Server {
   // Dashboard choices reach the notes with or without Gmail.
   const notes = deps.pipeline?.notes ?? new ThreadNotes(cfg, store, deps.vault);
   const projectName = (id: string) => cfg.projects.find((p) => p.id === id)?.name ?? id;
+  const outbox = deps.outbox ?? null;
+  // Signs second confirmations; a restart makes a pending confirmation ask again.
+  const confirmSecret = randomBytes(32).toString("hex");
+  const sending = () => ({ enabled: cfg.sending.enabled, connected: Boolean(outbox), undoSeconds: cfg.sending.undoSeconds });
 
   return http.createServer(async (req, res) => {
     try {
@@ -183,7 +199,8 @@ export function createServer(deps: ServerDeps): http.Server {
           lastPoll: deps.lastPoll(),
           doctor,
           projects: cfg.projects.map((p) => ({ id: p.id, name: p.name, folder: p.folder })),
-          phase: 1,
+          phase: 2,
+          sending: sending(),
         });
       }
 
@@ -208,6 +225,9 @@ export function createServer(deps: ServerDeps): http.Server {
             triage: item.triage,
             triageError: item.triageError,
             draft: item.draft,
+            recipients: replyRecipients(cfg, item),
+            outbox: store.outboxForItem(item.id),
+            sending: sending(),
           });
         }
 
@@ -247,8 +267,61 @@ export function createServer(deps: ServerDeps): http.Server {
           return send(res, 200, { ok: Boolean(updated?.triage), error: updated?.triageError ?? "" });
         }
 
-        if (req.method === "POST" && (parts[3] === "send" || parts[3] === "ack")) {
-          return send(res, 501, { error: "Sending arrives in phase 2. Copy the text and send it from Gmail." });
+        if (req.method === "POST" && (parts[3] === "send" || parts[3] === "gmail-draft")) {
+          const body = await readJson(req);
+          const kind = parts[3] === "gmail-draft" ? "draft" : body.kind;
+          if (kind !== "reply" && kind !== "ack" && kind !== "draft") return send(res, 400, { error: "kind must be reply or ack" });
+          if (kind !== "ack" && typeof body.text !== "string") return send(res, 400, { error: "text must be a string" });
+          // An acknowledgement is the one Claude wrote, sign-off included; the page cannot change it.
+          const text = kind === "ack" ? (item.triage?.ack_reply ?? "") : (body.text as string);
+          const request: SendRequest = { kind, to: stringList(body.to, "to"), cc: stringList(body.cc, "cc"), text };
+          if (!outbox) {
+            return send(res, 503, { error: "Gmail is not connected with permission to send. Run npm run auth on the Mac mini, then restart the service." });
+          }
+          if (kind !== "draft" && !cfg.sending.enabled) {
+            return send(res, 403, { error: "Sending is off. After npm run send-test, set sending.enabled to true in config.json and restart." });
+          }
+          const check = checkSend(cfg, item, request);
+          if (check.blockers.length) return send(res, 400, { error: check.blockers.join(" "), blockers: check.blockers });
+          if (kind === "draft") {
+            try {
+              await outbox.saveDraft(item, request.to, request.cc, text);
+            } catch (err) {
+              log("could not save a Gmail draft", err);
+              return send(res, 502, { error: `Gmail did not take the draft: ${err instanceof Error ? err.message : String(err)}` });
+            }
+            return send(res, 200, { ok: true });
+          }
+          const token = confirmToken(confirmSecret, item.id, request);
+          if (check.confirm.length && body.confirm !== token) {
+            return send(res, 409, { needsConfirm: true, reasons: check.confirm, to: request.to, cc: request.cc, token });
+          }
+          try {
+            const entry = outbox.queue(item, kind, request.to, request.cc, text);
+            return send(res, 202, entry);
+          } catch (err) {
+            if (err instanceof OutboxError) return send(res, 409, { error: err.message });
+            throw err;
+          }
+        }
+      }
+
+      if (parts[1] === "outbox" && parts[2]) {
+        const entry = store.outboxGet(parts[2]);
+        if (!entry) return send(res, 404, { error: "not found" });
+        if (req.method === "GET" && parts.length === 3) return send(res, 200, entry);
+        if (!outbox) return send(res, 503, { error: "Gmail is not connected with permission to send." });
+        if (req.method === "POST" && parts[3] === "undo") {
+          return outbox.undo(entry.id) ? send(res, 200, { ok: true }) : send(res, 409, { error: "Too late to undo: it has gone to Gmail." });
+        }
+        if (req.method === "POST" && parts[3] === "retry") {
+          if (!cfg.sending.enabled) return send(res, 403, { error: "Sending is off." });
+          try {
+            return send(res, 202, await outbox.retry(entry.id));
+          } catch (err) {
+            if (err instanceof OutboxError) return send(res, 409, { error: err.message });
+            throw err;
+          }
         }
       }
 

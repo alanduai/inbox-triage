@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { dataPath, isLoopback, type LoadedConfig } from "./config.js";
-import { authorizedClient, GMAIL_SCOPES, readToken } from "./gmail/auth.js";
+import { authorizedClient, GMAIL_SCOPES, MODIFY_SCOPE, readToken } from "./gmail/auth.js";
 import { GmailReader } from "./gmail/client.js";
 import { anthropicApiKey } from "./util/secrets.js";
 import { writePrivateFile } from "./util/files.js";
@@ -146,6 +146,12 @@ export async function doctor(cfg: LoadedConfig, opts: { online: boolean }): Prom
     token?.refresh_token ? "ok" : "fail",
     token?.refresh_token ? `scopes: ${scopes.join(", ") || GMAIL_SCOPES.join(", ")}` : "not authorized: run npm run auth",
   );
+  const canSend = scopes.includes(MODIFY_SCOPE);
+  if (cfg.sending.enabled) {
+    add("Sending", canSend ? "ok" : "fail", canSend ? `on, with ${cfg.sending.undoSeconds} seconds to undo` : "on in config.json, but the Gmail sign-in is read-only: run npm run auth");
+  } else {
+    add("Sending", "warn", canSend ? "off: run npm run send-test, then set sending.enabled to true" : "off, and the Gmail sign-in is read-only: run npm run auth, then npm run send-test");
+  }
 
   let apiKey: string | null = null;
   try {

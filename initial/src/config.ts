@@ -86,6 +86,14 @@ const ConfigSchema = z.object({
       token: z.string().min(24).optional(),
     })
     .default({ host: "127.0.0.1", port: 8787 }),
+  sending: z
+    .object({
+      // Off until you have run `npm run send-test` and checked the two test messages.
+      enabled: z.boolean().default(false),
+      // How long Undo stays available after you press Send.
+      undoSeconds: z.number().int().min(3).max(60).default(5),
+    })
+    .default({ enabled: false, undoSeconds: 5 }),
   // Message store, tokens and logs. Relative to the config file.
   dataDir: z.string().default("data"),
 });

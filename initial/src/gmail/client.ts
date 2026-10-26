@@ -1,5 +1,7 @@
 import { gmail, type gmail_v1 } from "@googleapis/gmail";
 import type { OAuth2Client } from "google-auth-library";
+import { ATTACHMENT_TIMEOUT_MS, GMAIL_TIMEOUT_MS } from "./errors.js";
+import { OUTBOX_HEADER } from "./mime.js";
 import { completeBody, decodeBase64Url, parseAddressList, parseMessage, type AttachmentRef, type ParsedMessage } from "./parse.js";
 
 export interface ThreadMeta {
@@ -8,9 +10,11 @@ export interface ThreadMeta {
   labelIds: string[];
   fromEmail: string;
   recipients: string[];
+  // The outbox id of a message sent from the dashboard, "" otherwise.
+  ref: string;
 }
 
-/** The few Gmail calls phase 1 needs. Read-only. */
+/** The Gmail calls for reading. Sending is in GmailSender. */
 export class GmailReader {
   private readonly api: gmail_v1.Gmail;
 
@@ -19,7 +23,7 @@ export class GmailReader {
   }
 
   async profileEmail(): Promise<string> {
-    const res = await this.api.users.getProfile({ userId: "me" });
+    const res = await this.api.users.getProfile({ userId: "me" }, { timeout: GMAIL_TIMEOUT_MS });
     return res.data.emailAddress ?? "";
   }
 
@@ -28,7 +32,7 @@ export class GmailReader {
     const ids: string[] = [];
     let pageToken: string | undefined;
     for (let page = 0; page < maxPages; page++) {
-      const res = await this.api.users.messages.list({ userId: "me", q: query, maxResults: 100, pageToken });
+      const res = await this.api.users.messages.list({ userId: "me", q: query, maxResults: 100, pageToken }, { timeout: GMAIL_TIMEOUT_MS });
       for (const m of res.data.messages ?? []) if (m.id) ids.push(m.id);
       pageToken = res.data.nextPageToken ?? undefined;
       if (!pageToken) return { ids, truncated: false };
@@ -37,13 +41,13 @@ export class GmailReader {
   }
 
   async message(id: string): Promise<ParsedMessage> {
-    const res = await this.api.users.messages.get({ userId: "me", id, format: "full" });
+    const res = await this.api.users.messages.get({ userId: "me", id, format: "full" }, { timeout: GMAIL_TIMEOUT_MS });
     return this.complete(parseMessage(res.data));
   }
 
   /** Every message of a thread, oldest first, without drafts. */
   async thread(id: string): Promise<ParsedMessage[]> {
-    const res = await this.api.users.threads.get({ userId: "me", id, format: "full" });
+    const res = await this.api.users.threads.get({ userId: "me", id, format: "full" }, { timeout: GMAIL_TIMEOUT_MS });
     const messages = (res.data.messages ?? []).filter((m) => !(m.labelIds ?? []).includes("DRAFT")).map(parseMessage);
     const complete = await Promise.all(messages.map((m) => this.complete(m)));
     return complete.sort((a, b) => a.internalDate.getTime() - b.internalDate.getTime());
@@ -54,7 +58,7 @@ export class GmailReader {
     if (!msg.deferredBody.length) return msg;
     const fetched = [];
     for (const part of msg.deferredBody) {
-      const res = await this.api.users.messages.attachments.get({ userId: "me", messageId: msg.id, id: part.attachmentId });
+      const res = await this.api.users.messages.attachments.get({ userId: "me", messageId: msg.id, id: part.attachmentId }, { timeout: ATTACHMENT_TIMEOUT_MS });
       fetched.push({ mimeType: part.mimeType, data: decodeBase64Url(res.data.data ?? ""), charset: part.charset });
     }
     return completeBody(msg, fetched);
@@ -62,7 +66,7 @@ export class GmailReader {
 
   /** Light view of a thread: who wrote each message, to whom and when, without bodies. */
   async threadMeta(id: string): Promise<ThreadMeta[]> {
-    const res = await this.api.users.threads.get({ userId: "me", id, format: "metadata", metadataHeaders: ["From", "To", "Cc"] });
+    const res = await this.api.users.threads.get({ userId: "me", id, format: "metadata", metadataHeaders: ["From", "To", "Cc", OUTBOX_HEADER] }, { timeout: GMAIL_TIMEOUT_MS });
     return (res.data.messages ?? []).map((m) => {
       const h = (name: string) =>
         (m.payload?.headers ?? []).filter((x) => x.name?.toLowerCase() === name).map((x) => x.value ?? "").join(", ");
@@ -72,6 +76,7 @@ export class GmailReader {
         labelIds: m.labelIds ?? [],
         fromEmail: parseAddressList(h("from"))[0]?.email ?? "",
         recipients: [...parseAddressList(h("to")), ...parseAddressList(h("cc"))].map((a) => a.email),
+        ref: h(OUTBOX_HEADER.toLowerCase()).trim(),
       };
     });
   }
@@ -79,7 +84,7 @@ export class GmailReader {
   async attachment(messageId: string, ref: AttachmentRef): Promise<Buffer> {
     if (ref.data) return decodeBase64Url(ref.data);
     if (!ref.attachmentId) throw new Error(`Attachment ${ref.filename} has no data`);
-    const res = await this.api.users.messages.attachments.get({ userId: "me", messageId, id: ref.attachmentId });
+    const res = await this.api.users.messages.attachments.get({ userId: "me", messageId, id: ref.attachmentId }, { timeout: ATTACHMENT_TIMEOUT_MS });
     return decodeBase64Url(res.data.data ?? "");
   }
 }

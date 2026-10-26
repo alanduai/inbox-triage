@@ -98,6 +98,32 @@ export function answers(recipients: string[], item: { fromEmail: string; replyTo
   });
 }
 
+export interface Recipients {
+  to: string[];
+  cc: string[];
+}
+
+/**
+ * Reply all, as Gmail does it: To is the reply address plus the original To, Cc is the original
+ * Cc, without your own addresses and with nobody twice. Mail from the court or the other side goes
+ * to your own lawyer alone, because a reply all would copy the court and the other side.
+ */
+export function replyRecipients(
+  cfg: Pick<LoadedConfig, "owner">,
+  item: { replyToEmail: string; replyRedirected: boolean; to: string[]; cc: string[] },
+): Recipients {
+  if (item.replyRedirected) return { to: [normalizeEmail(item.replyToEmail)], cc: [] };
+  const seen = new Set<string>();
+  const keep = (list: string[]) =>
+    list.map(normalizeEmail).filter((e) => {
+      if (!e || isOwner(cfg, e) || seen.has(e)) return false;
+      seen.add(e);
+      return true;
+    });
+  const to = keep([item.replyToEmail, ...item.to]);
+  return { to, cc: keep(item.cc) };
+}
+
 /** A stable fingerprint of the contact rules, to notice when they change. */
 export function rulesFingerprint(cfg: Pick<LoadedConfig, "projects">): string {
   return JSON.stringify(cfg.projects.map((p) => [p.id, p.contacts.map((c) => c.match).sort()]));

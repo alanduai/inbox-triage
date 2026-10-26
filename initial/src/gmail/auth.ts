@@ -6,8 +6,9 @@ import { CodeChallengeMethod, OAuth2Client, type Credentials } from "google-auth
 import { dataPath, type LoadedConfig } from "../config.js";
 import { writePrivateFile } from "../util/files.js";
 
-// Phase 1 only reads. Phase 2 adds gmail.modify (mark read, archive) and gmail.send.
-export const GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"];
+// gmail.modify: read, send, save drafts, mark read and archive. It cannot delete mail for good.
+export const MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify";
+export const GMAIL_SCOPES = [MODIFY_SCOPE];
 
 interface ClientSecrets {
   client_id: string;
@@ -33,6 +34,11 @@ export function readToken(cfg: LoadedConfig): Credentials | null {
   const file = tokenFile(cfg);
   if (!fs.existsSync(file)) return null;
   return JSON.parse(fs.readFileSync(file, "utf8")) as Credentials;
+}
+
+/** Whether the stored sign-in allows sending (phase 1 sign-ins were read-only). */
+export function tokenCanSend(cfg: LoadedConfig): boolean {
+  return (readToken(cfg)?.scope ?? "").split(" ").includes(MODIFY_SCOPE);
 }
 
 function saveToken(cfg: LoadedConfig, token: Credentials): void {

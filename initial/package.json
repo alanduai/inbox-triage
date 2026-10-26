@@ -18,6 +18,7 @@
     "auth": "node --disable-warning=ExperimentalWarning dist/src/cli.js auth",
     "doctor": "node --disable-warning=ExperimentalWarning dist/src/cli.js doctor --online",
     "poll": "node --disable-warning=ExperimentalWarning dist/src/cli.js poll",
+    "send-test": "node --disable-warning=ExperimentalWarning dist/src/cli.js send-test",
     "start": "node --disable-warning=ExperimentalWarning dist/src/cli.js run"
   },
   "dependencies": {
