@@ -24,14 +24,14 @@ export async function sendTest(cfg: LoadedConfig, sender: GmailSender): Promise<
   const first = await sender.sendNew(
     toRaw(
       buildMessage({
-        from: me, to: [me], cc: [], subject, inReplyTo: "", references: "", outboxId: firstId, kind: "reply", date: new Date(),
+        from: me, to: [me], cc: [], subject, inReplyTo: "", references: "", outboxId: firstId, date: new Date(),
         body: "A test from inbox-triage. It is archived when the test ends; you can delete it.\n\nLijep pozdrav · Med vänlig hälsning",
       }),
     ),
   );
   add("Send a message to yourself", Boolean(first.id), first.id ? `message ${first.id}` : "Gmail returned no id");
   const h1 = await sender.headers(first.id, ["Message-ID", "Subject", OUTBOX_HEADER]);
-  add("Our outbox header is kept", (h1[OUTBOX_HEADER.toLowerCase()] ?? "").trim() === firstId, h1[OUTBOX_HEADER.toLowerCase()] ? "present" : "missing: a retry could not tell whether a send went out");
+  add("The reference header is kept", (h1[OUTBOX_HEADER.toLowerCase()] ?? "").trim() === firstId, h1[OUTBOX_HEADER.toLowerCase()] ? "present" : "missing: a retry could not tell whether a send went out");
   const gotSubject = decodeEncodedWords(h1["subject"] ?? "");
   add("Croatian and Swedish letters survive", gotSubject === subject, `subject came back as "${gotSubject}"`);
 
@@ -39,7 +39,7 @@ export async function sendTest(cfg: LoadedConfig, sender: GmailSender): Promise<
   const replyGmailId = await sender.send(
     toRaw(
       buildReply({
-        from: me, to: [me], cc: [], subject, inReplyTo: h1["message-id"] ?? "", references: "", outboxId: replyId, kind: "reply", date: new Date(),
+        from: me, to: [me], cc: [], subject, inReplyTo: h1["message-id"] ?? "", references: "", outboxId: replyId, date: new Date(),
         body: "The reply half of the test.",
       }),
     ),
@@ -49,7 +49,7 @@ export async function sendTest(cfg: LoadedConfig, sender: GmailSender): Promise<
   add("The reply stays in the thread", h2["x-thread-id"] === first.threadId, h2["x-thread-id"] === first.threadId ? `thread ${first.threadId}` : `went to thread ${h2["x-thread-id"]}, expected ${first.threadId}`);
   const found = await sender.findSent(first.threadId, replyId);
   add("A sent reply can be found by its outbox id", found === replyGmailId, found ? `found ${found}` : "not found");
-  await sender.archiveThread(first.threadId);
+  await sender.archiveUpTo(first.threadId, new Date());
   add("Mark read and archive", true, "the test thread is out of your inbox");
   return steps;
 }

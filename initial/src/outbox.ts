@@ -171,7 +171,7 @@ export class Outbox {
     if (!(e.effects & EFFECT_NOTE) && notes.recordSent(item, e)) store.addEffects(e.id, EFFECT_NOTE);
     if (!(e.effects & EFFECT_ARCHIVE)) {
       try {
-        await sender.archiveThread(item.threadId);
+        await sender.archiveUpTo(item.threadId, new Date(item.receivedAt));
         store.addEffects(e.id, EFFECT_ARCHIVE);
       } catch (err) {
         log(`could not archive thread ${item.threadId} yet`, err);
@@ -195,9 +195,8 @@ export class Outbox {
       subject: original.subject === "(no subject)" ? "" : original.subject,
       inReplyTo: original.rfc822MessageId,
       references: original.references,
-      body: withQuote(e.body, { date: original.internalDate, fromName: original.from.name, fromEmail: original.from.email, text: original.text }, language, cfg.tz),
+      body: withQuote(e.body, { date: original.internalDate, fromEmail: original.from.email, text: original.text }, language, cfg.tz),
       outboxId: e.id,
-      kind: e.kind,
       date: new Date(),
     });
   }

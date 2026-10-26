@@ -431,9 +431,11 @@ export class Pipeline {
         log(`could not check thread ${threadId}`, err);
         continue;
       }
-      // An acknowledgement from the dashboard is a holding reply: it closes nothing.
+      // An acknowledgement from the dashboard is a holding reply: it closes nothing. It is known by
+      // its Gmail id, or by its outbox id while that is still being recorded.
       const acks = new Set(this.store.ackGmailIds(threadId));
-      const sent = meta.filter((m) => isSentReply(m.labelIds) && m.kind !== "ack" && !acks.has(m.id));
+      const isAck = (m: { id: string; ref?: string }) => acks.has(m.id) || (Boolean(m.ref) && this.store.outboxGet(m.ref!)?.kind === "ack");
+      const sent = meta.filter((m) => isSentReply(m.labelIds) && !isAck(m));
       for (const item of this.store.openInThread(threadId)) {
         // A reply closes what asked for a reply; a task without a reply (needs_action) waits for you.
         if (item.status === "pending_triage" || item.status === "needs_action") continue;

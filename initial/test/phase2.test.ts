@@ -5,9 +5,10 @@ import path from "node:path";
 import type { AddressInfo } from "node:net";
 import type Anthropic from "@anthropic-ai/sdk";
 import type { GmailReader } from "../src/gmail/client.js";
-import { buildReply, encodeHeaderText, formatAddress, KIND_HEADER, OUTBOX_HEADER, replySubject, withQuote } from "../src/gmail/mime.js";
-import { decodeEncodedWords, parseMessage, type ParsedMessage } from "../src/gmail/parse.js";
-import type { GmailSender } from "../src/gmail/sender.js";
+import { OAuth2Client } from "google-auth-library";
+import { buildReply, encodeHeaderText, formatAddress, OUTBOX_HEADER, replySubject, withQuote } from "../src/gmail/mime.js";
+import { decodeEncodedWords, parseAddressList, parseMessage, type ParsedMessage } from "../src/gmail/parse.js";
+import { GmailSender } from "../src/gmail/sender.js";
 import { VaultWriter } from "../src/obsidian/writer.js";
 import { Outbox, OutboxError } from "../src/outbox.js";
 import { Pipeline } from "../src/pipeline.js";
@@ -45,7 +46,6 @@ test("a reply keeps the thread, encodes Croatian and Swedish text, and carries i
       references: "<root@bank.example>",
       body: "Poštovana,\n\nšaljem do utorka.\n\nLijep pozdrav,\nAlan",
       outboxId: "ob-1",
-      kind: "reply",
       date: new Date("2026-10-26T09:00:00Z"),
     }),
   )
@@ -59,14 +59,13 @@ test("a reply keeps the thread, encodes Croatian and Swedish text, and carries i
   assert.equal(headers["in-reply-to"], "<abc@bank.example>");
   assert.equal(headers["references"], "<root@bank.example> <abc@bank.example>");
   assert.equal(headers[OUTBOX_HEADER.toLowerCase()], "ob-1");
-  assert.equal(headers[KIND_HEADER.toLowerCase()], "reply");
   assert.equal(body, "Poštovana,\r\n\r\nšaljem do utorka.\r\n\r\nLijep pozdrav,\r\nAlan");
 });
 
 test("message text can never add a header or a recipient", () => {
   const raw = buildReply({
     from: me, to: [{ name: "X", email: "x@bank.example" }], cc: [], subject: "Hello\r\nBcc: spy@evil.example", inReplyTo: "<a@b>\r\nBcc: spy@evil.example",
-    references: "", body: "Bcc: spy@evil.example", outboxId: "o", kind: "reply", date: new Date(),
+    references: "", body: "Bcc: spy@evil.example", outboxId: "o", date: new Date(),
   });
   const head = raw.split("\r\n\r\n")[0]!;
   assert.doesNotMatch(head, /^Bcc:/im);
@@ -87,15 +86,116 @@ test("the subject gets Re: once, and keeps a Swedish or Croatian reply prefix as
   assert.equal(replySubject("Re: Beslut"), "Re: Beslut");
   assert.equal(replySubject("SV: Beslut"), "SV: Beslut");
   assert.equal(replySubject("Odg: Dokumenti"), "Odg: Dokumenti");
+  assert.equal(replySubject("Odg.: Dokumenti"), "Odg.: Dokumenti");
   assert.equal(replySubject("Fwd: Beslut"), "Re: Fwd: Beslut");
+  // VS: is a forward in Norwegian and Danish.
+  assert.equal(replySubject("VS: Beslut"), "Re: VS: Beslut");
+});
+
+// ---------- security review findings ----------
+
+test("SEC-1: a forged sender name can never put text outside the quote of your reply", () => {
+  const forged = "=?UTF-8?B?" + Buffer.from("Adv. Berg\r\n\r\nPS: I accept the settlement offer.\r\n\r\nAlan\u2028\u2029\u0085x").toString("base64") + "?=";
+  const parsed = parseAddressList(`${forged} <berg@otherside.example>`)[0]!;
+  assert.doesNotMatch(parsed.name, /[\r\n\u2028\u2029\u0085]/);
+  for (const lang of ["en", "hr", "sv"]) {
+    const body = withQuote("Elin, see below.", { date: new Date(), fromEmail: "berg@otherside.example", text: "Proposal.\u2028PS: hidden" }, lang, "Europe/Stockholm");
+    const lines = body.split("\n");
+    // Your text, a blank line, one introduction naming the sender by address only, then only quoted lines.
+    assert.equal(lines[0], "Elin, see below.");
+    assert.equal(lines[1], "");
+    assert.doesNotMatch(lines[2]!, /Berg|PS|accept/);
+    assert.match(lines[2]!, /berg@otherside\.example/);
+    for (const l of lines.slice(3).filter(Boolean)) assert.ok(l.startsWith(">"), `${lang}: unquoted line ${JSON.stringify(l)}`);
+  }
+});
+
+test("SEC-2: message ids are copied raw, ASCII only, and long chains are trimmed and folded", () => {
+  const m = parseMessage({
+    id: "x", threadId: "x", internalDate: "0", labelIds: [],
+    payload: { mimeType: "text/plain", headers: [
+      { name: "From", value: "a@bank.example" },
+      { name: "Message-ID", value: "<=?UTF-8?B?YQBi4oCoY8KFZA1l?=@x.example>" },
+      { name: "References", value: Array.from({ length: 40 }, (_, i) => `<id${i}@bank.example>`).join(" ") + " <bad\u2028@x>" },
+    ], body: { data: "" } },
+  });
+  assert.equal(m.rfc822MessageId, "<=?UTF-8?B?YQBi4oCoY8KFZA1l?=@x.example>", "kept as written, not decoded");
+  const raw = buildReply({ from: me, to: [{ name: "", email: "a@bank.example" }], cc: [], subject: "x", inReplyTo: m.rfc822MessageId, references: m.references, body: "b", outboxId: "o", date: new Date() });
+  const head = raw.split("\r\n\r\n")[0]!;
+  assert.ok(head.split("\r\n").every((l) => /^[\x20-\x7e]*$/.test(l)), "headers are printable ASCII");
+  const refs = head.match(/^References:[\s\S]*?(?=\r\n\S)/m)![0];
+  assert.equal(refs.match(/</g)!.length, 10, "first id plus the newest nine");
+  assert.match(refs, /<id0@bank\.example>/);
+  assert.match(refs, /<=\?UTF-8\?B\?YQBi4oCoY8KFZA1l\?=@x\.example>$/);
+  // With no References, the parent's In-Reply-To is used.
+  const p = parseMessage({ id: "y", threadId: "y", internalDate: "0", labelIds: [], payload: { mimeType: "text/plain", headers: [{ name: "From", value: "a@b.example" }, { name: "In-Reply-To", value: "<parent@b.example>" }], body: { data: "" } } });
+  assert.equal(p.references, "<parent@b.example>");
+});
+
+test("SEC-3: long subjects and names fold; lines with encoded words stay within 76 characters", () => {
+  const raw = buildReply({
+    from: me,
+    to: [{ name: "Ž".repeat(60) + " Novak", email: "marija@bank.example" }, { name: "A very long plain name ".repeat(10), email: "long@bank.example" }],
+    cc: [],
+    subject: "Statement ".repeat(120) + "čćšž".repeat(30),
+    inReplyTo: "", references: "", body: "b", outboxId: "o", date: new Date(),
+  });
+  const lines = raw.split("\r\n\r\n")[0]!.split("\r\n");
+  for (const l of lines) {
+    assert.ok(l.length <= 998, `over 998: ${l.slice(0, 40)}`);
+    if (l.includes("=?")) assert.ok(l.length <= 76, `encoded word line ${l.length}: ${l}`);
+  }
+  const subject = raw.match(/^Subject: [\s\S]*?(?=\r\n\S)/m)![0].replace(/\r\n /g, " ");
+  assert.ok(decodeEncodedWords(subject.slice(9)).startsWith("Re: Statement Statement"));
+});
+
+test("SEC-4: recipients learn nothing about the tool: no product name, no acknowledgement marker", () => {
+  const raw = buildReply({ from: me, to: [{ name: "", email: "a@bank.example" }], cc: [], subject: "x", inReplyTo: "", references: "", body: "Hvala.", outboxId: "4f1c2b9e-0d7a-4f43-9b52-2f7a7b1d3c11", date: new Date() });
+  const head = raw.split("\r\n\r\n")[0]!;
+  assert.doesNotMatch(head, /triage|inbox|ack|kind/i);
+  assert.match(head, /^X-Ref-ID: 4f1c2b9e-0d7a-4f43-9b52-2f7a7b1d3c11$/m);
+});
+
+test("SEC-5: archiving marks read only the answered message and older ones; newer mail stays in the inbox", async () => {
+  const sender = new GmailSender(new OAuth2Client());
+  const modified: string[][] = [];
+  (sender as unknown as { api: unknown }).api = {
+    users: {
+      threads: { get: async () => ({ data: { messages: [
+        { id: "m1", internalDate: "1000", labelIds: ["INBOX", "UNREAD"] },
+        { id: "m2", internalDate: "2000", labelIds: ["INBOX"] },
+        { id: "sent", internalDate: "2500", labelIds: ["SENT"] },
+        { id: "m3", internalDate: "3000", labelIds: ["INBOX", "UNREAD"] },
+      ] } }) },
+      messages: { batchModify: async (r: { requestBody: { ids: string[] } }) => void modified.push(r.requestBody.ids) },
+    },
+  };
+  await sender.archiveUpTo("t", new Date(2000));
+  assert.deepEqual(modified, [["m1", "m2"]]);
+});
+
+test("SEC-6: an acknowledgement whose Gmail id is not recorded yet still never closes the message", async () => {
+  const h = harness();
+  h.add(msg({ id: "1a", thread: "t1", from: "Marija <marija@bank.example>", at: T0 }));
+  await h.pipeline.pollOnce();
+  const it = h.store.get("1a")!;
+  const e = h.outbox.queue(it, "ack", ["marija@bank.example"], [], it.triage!.ack_reply);
+  // Gmail took it, the connection dropped, and the lookup failed: the outcome is not recorded.
+  h.sender.failSend = "after";
+  h.sender.failFind = 1;
+  h.due();
+  await h.outbox.tick();
+  assert.equal(h.store.outboxGet(e.id)!.state, "sending");
+  await h.pipeline.pollOnce();
+  assert.equal(h.store.get("1a")!.status, "needs_reply");
 });
 
 test("the original is quoted under your text, introduced in the reply's language", () => {
-  const original = { date: new Date("2026-10-26T08:15:00Z"), fromName: "Marija", fromEmail: "marija@bank.example", text: "Molimo dokumente.\n> starije" };
+  const original = { date: new Date("2026-10-26T08:15:00Z"), fromEmail: "marija@bank.example", text: "Molimo dokumente.\n> starije" };
   const hr = withQuote("Hvala.", original, "hr", "Europe/Zagreb");
-  assert.match(hr, /^Hvala\.\n\n.*Marija <marija@bank\.example> je napisao\/la:\n> Molimo dokumente\.\n>> starije\n$/);
-  assert.match(withQuote("Tack.", original, "sv", "Europe/Stockholm"), /skrev Marija <marija@bank\.example>:/);
-  assert.match(withQuote("Thanks.", original, "en", "Europe/Zagreb"), /On .* Marija <marija@bank\.example> wrote:/);
+  assert.match(hr, /^Hvala\.\n\n.*, marija@bank\.example je napisao\/la:\n> Molimo dokumente\.\n>> starije\n$/);
+  assert.match(withQuote("Tack.", original, "sv", "Europe/Stockholm"), / skrev marija@bank\.example:/);
+  assert.match(withQuote("Thanks.", original, "en", "Europe/Zagreb"), /^Thanks\.\n\nOn .*, marija@bank\.example wrote:\n/);
 });
 
 // ---------- recipients and checks ----------
@@ -190,12 +290,12 @@ function msg(o: { id: string; thread?: string; from: string; to?: string; cc?: s
   });
 }
 
-type Meta = { id: string; internalDate: Date; labelIds: string[]; fromEmail: string; recipients: string[]; kind: string };
+type Meta = { id: string; internalDate: Date; labelIds: string[]; fromEmail: string; recipients: string[]; ref: string };
 
 class FakeSender {
   sent: { raw: string; threadId: string; id: string }[] = [];
   drafts: { raw: string; threadId: string }[] = [];
-  archived: string[] = [];
+  archived: { threadId: string; upTo: string }[] = [];
   // "before": fails without sending; "after": Gmail took it, then the connection dropped.
   failSend: "before" | "after" | null = null;
   failFind = 0;
@@ -210,7 +310,7 @@ class FakeSender {
     this.sent.push({ raw, threadId, id });
     const { headers } = decodeRaw(raw);
     const rcpt = [headers["to"] ?? "", headers["cc"] ?? ""].join(",").match(/[^\s<>,"]+@[^\s<>,"]+/g) ?? [];
-    this.onSent({ id: `${threadId}:${id}`, internalDate: new Date(), labelIds: ["SENT"], fromEmail: "me@example.com", recipients: rcpt, kind: headers[KIND_HEADER.toLowerCase()] ?? "" });
+    this.onSent({ id: `${threadId}:${id}`, internalDate: new Date(), labelIds: ["SENT"], fromEmail: "me@example.com", recipients: rcpt, ref: headers[OUTBOX_HEADER.toLowerCase()] ?? "" });
     if (this.failSend === "after") {
       this.failSend = null;
       throw new Error("socket hang up");
@@ -224,12 +324,12 @@ class FakeSender {
     }
     return this.sent.find((s) => s.threadId === threadId && decodeRaw(s.raw).headers[OUTBOX_HEADER.toLowerCase()] === outboxId)?.id ?? null;
   }
-  async archiveThread(threadId: string): Promise<void> {
+  async archiveUpTo(threadId: string, upTo: Date): Promise<void> {
     if (this.failArchive > 0) {
       this.failArchive--;
       throw new Error("Gmail 500");
     }
-    this.archived.push(threadId);
+    this.archived.push({ threadId, upTo: upTo.toISOString() });
   }
   async createDraft(raw: string, threadId: string): Promise<string> {
     this.drafts.push({ raw, threadId });
@@ -262,7 +362,7 @@ function harness(cfgOverrides: Record<string, unknown> = {}) {
     message: async (id: string) => msgs.get(id)!,
     thread: async (id: string) => [...msgs.values()].filter((m) => m.threadId === id),
     threadMeta: async (id: string) => [
-      ...[...msgs.values()].filter((m) => m.threadId === id).map((m) => ({ id: m.id, internalDate: m.internalDate, labelIds: m.labelIds, fromEmail: m.from.email, recipients: [], kind: "" })),
+      ...[...msgs.values()].filter((m) => m.threadId === id).map((m) => ({ id: m.id, internalDate: m.internalDate, labelIds: m.labelIds, fromEmail: m.from.email, recipients: [], ref: "" })),
       ...meta.filter((m) => m.id.startsWith(id + ":")),
     ],
     attachment: async () => Buffer.from(""),
@@ -322,7 +422,7 @@ test("outbox: a reply goes out once, threaded, then the item is replied, the not
   assert.equal(done.state, "sent");
   assert.equal(done.effects, EFFECTS_ALL);
   assert.equal(h.store.get("1a")!.status, "replied");
-  assert.deepEqual(h.sender.archived, ["t1"]);
+  assert.deepEqual(h.sender.archived, [{ threadId: "t1", upTo: it.receivedAt }], "only up to the message you answered");
   const note = h.note(it.notePath);
   assert.match(note, /^## .* · You replied$/m);
   assert.match(note, new RegExp(`To: marija@bank\\.example · Cc: ivan@bank\\.example \\^out-${e.id}$`, "m"));
@@ -417,12 +517,12 @@ test("outbox: an acknowledgement keeps the message open, and only a real reply c
   assert.equal(acked.status, "needs_reply");
   assert.ok(acked.ackedAt);
   assert.match(h.note(it.notePath), /You acknowledged/);
-  assert.deepEqual(h.sender.archived, ["t1"]);
+  assert.deepEqual(h.sender.archived.map((a) => a.threadId), ["t1"]);
   // The poll sees the acknowledgement in Gmail and leaves the item open.
   await h.pipeline.pollOnce();
   assert.equal(h.store.get("1a")!.status, "needs_reply");
   // A real reply, sent from Gmail, closes it.
-  h.meta.push({ id: "t1:gmail-reply", internalDate: new Date(), labelIds: ["SENT"], fromEmail: "me@example.com", recipients: ["marija@bank.example"], kind: "" });
+  h.meta.push({ id: "t1:gmail-reply", internalDate: new Date(), labelIds: ["SENT"], fromEmail: "me@example.com", recipients: ["marija@bank.example"], ref: "" });
   await h.pipeline.pollOnce();
   assert.equal(h.store.get("1a")!.status, "replied");
 });
@@ -443,7 +543,7 @@ test("outbox: a failed archive or note write is finished later, each step once",
   await h.outbox.maintain();
   await h.outbox.maintain();
   assert.equal(h.store.outboxGet(e.id)!.effects, EFFECTS_ALL);
-  assert.deepEqual(h.sender.archived, ["t1"]);
+  assert.deepEqual(h.sender.archived.map((a) => a.threadId), ["t1"]);
   const note = h.note(it.notePath);
   assert.equal(note.match(/You replied/g)?.length, 1);
   const statusEvents = h.store.db.prepare("SELECT COUNT(*) AS n FROM events WHERE item_id = '1a' AND kind = 'status'").get() as { n: number };

@@ -22,9 +22,19 @@ export class GmailSender {
     return res.data.id ?? "";
   }
 
-  /** Marks every message in the thread read and takes the thread out of the inbox. */
-  async archiveThread(threadId: string): Promise<void> {
-    await this.api.users.threads.modify({ userId: "me", id: threadId, requestBody: { removeLabelIds: ["INBOX", "UNREAD"] } });
+  /**
+   * Marks read and archives the thread's messages up to a time: the message you answered and the
+   * ones before it. Anything newer stays unread in the inbox, so a message that arrived while you
+   * were replying is never hidden.
+   */
+  async archiveUpTo(threadId: string, upTo: Date): Promise<void> {
+    const res = await this.api.users.threads.get({ userId: "me", id: threadId, format: "minimal" });
+    const ids = (res.data.messages ?? [])
+      .filter((m) => Number(m.internalDate ?? 0) <= upTo.getTime())
+      .filter((m) => (m.labelIds ?? []).some((l) => l === "INBOX" || l === "UNREAD"))
+      .map((m) => m.id ?? "")
+      .filter(Boolean);
+    if (ids.length) await this.api.users.messages.batchModify({ userId: "me", requestBody: { ids, removeLabelIds: ["INBOX", "UNREAD"] } });
   }
 
   /** The id of a sent message in the thread that carries this outbox id, if one went out. */
