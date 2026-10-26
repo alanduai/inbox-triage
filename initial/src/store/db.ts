@@ -133,7 +133,9 @@ CREATE TABLE IF NOT EXISTS outbox (
   gmail_id TEXT,
   sent_at TEXT,
   error TEXT NOT NULL DEFAULT '',
-  effects INTEGER NOT NULL DEFAULT 0
+  effects INTEGER NOT NULL DEFAULT 0,
+  queued_at TEXT,
+  attempt INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS outbox_state ON outbox(state);
 CREATE INDEX IF NOT EXISTS outbox_item ON outbox(item_id);
@@ -205,6 +207,10 @@ export interface OutboxEntry {
   state: OutboxState;
   sendAt: string;
   createdAt: string;
+  // When you pressed Send, or Retry: the reply answers what was there then, and Undo counts from it.
+  queuedAt: string;
+  // Which Gmail call is the current one; only that call may mark the send failed.
+  attempt: number;
   attemptAt: string | null;
   gmailId: string | null;
   sentAt: string | null;
@@ -223,6 +229,8 @@ function toOutbox(r: Row): OutboxEntry {
     state: String(r.state) as OutboxState,
     sendAt: String(r.send_at),
     createdAt: String(r.created_at),
+    queuedAt: String(r.queued_at ?? r.created_at),
+    attempt: Number(r.attempt ?? 0),
     attemptAt: r.attempt_at == null ? null : String(r.attempt_at),
     gmailId: r.gmail_id == null ? null : String(r.gmail_id),
     sentAt: r.sent_at == null ? null : String(r.sent_at),
@@ -247,6 +255,9 @@ export class Store {
     // Whether the note is behind: 0 no, 1 its details (frontmatter, triage and attachment lines),
     // 2 its checkbox too (the status changed). Set with the change, cleared once the note is written.
     if (!cols.has("note_stale")) this.db.exec("ALTER TABLE items ADD COLUMN note_stale INTEGER NOT NULL DEFAULT 0");
+    const outboxCols = new Set((this.db.prepare("PRAGMA table_info(outbox)").all() as Row[]).map((r) => String(r.name)));
+    if (!outboxCols.has("queued_at")) this.db.exec("ALTER TABLE outbox ADD COLUMN queued_at TEXT");
+    if (!outboxCols.has("attempt")) this.db.exec("ALTER TABLE outbox ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0");
     if (!cols.has("acked_at")) this.db.exec("ALTER TABLE items ADD COLUMN acked_at TEXT");
     if (!cols.has("file_attempts")) this.db.exec("ALTER TABLE items ADD COLUMN file_attempts INTEGER NOT NULL DEFAULT 0");
     // Thread notes are now kept per matter; carry over the first release's table.
@@ -487,10 +498,10 @@ export class Store {
     const now = new Date().toISOString();
     const r = this.db
       .prepare(
-        `INSERT INTO outbox (id, item_id, kind, to_json, cc_json, body, state, send_at, created_at)
-         SELECT ?, ?, ?, ?, ?, ?, 'queued', ?, ? WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE item_id = ? AND state IN ('queued', 'sending'))`,
+        `INSERT INTO outbox (id, item_id, kind, to_json, cc_json, body, state, send_at, created_at, queued_at)
+         SELECT ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE item_id = ? AND state IN ('queued', 'sending'))`,
       )
-      .run(e.id, e.itemId, e.kind, JSON.stringify(e.to), JSON.stringify(e.cc), e.body, e.sendAt, now, e.itemId);
+      .run(e.id, e.itemId, e.kind, JSON.stringify(e.to), JSON.stringify(e.cc), e.body, e.sendAt, now, now, e.itemId);
     if (Number(r.changes)) this.log(e.itemId, "send_queued", `${e.kind} ${e.id} to ${[...e.to, ...e.cc].join(", ")}`);
     return Number(r.changes) === 1;
   }
@@ -513,10 +524,10 @@ export class Store {
     return (this.db.prepare("SELECT * FROM outbox WHERE state = 'queued' AND send_at <= ? ORDER BY send_at").all(nowIso) as Row[]).map(toOutbox);
   }
 
-  /** Takes a queued send for delivery. False when it was undone or another worker took it. */
-  outboxClaim(id: string): boolean {
-    const r = this.db.prepare("UPDATE outbox SET state = 'sending', attempt_at = ? WHERE id = ? AND state = 'queued'").run(new Date().toISOString(), id);
-    return Number(r.changes) === 1;
+  /** Takes a queued send for delivery; returns the attempt number, or 0 when it was undone or taken. */
+  outboxClaim(id: string): number {
+    const r = this.db.prepare("UPDATE outbox SET state = 'sending', attempt_at = ?, attempt = attempt + 1 WHERE id = ? AND state = 'queued'").run(new Date().toISOString(), id);
+    return Number(r.changes) === 1 ? (this.outboxGet(id)?.attempt ?? 0) : 0;
   }
 
   /** Undo: only while it is still in the Undo window. */
@@ -527,14 +538,27 @@ export class Store {
     return Number(r.changes) === 1;
   }
 
+  /**
+   * A send Gmail confirmed is recorded as sent, whatever the row said meanwhile: a message that
+   * went out is never sent again, and is shown as sent even if Undo or Retry came too late.
+   */
   outboxSent(id: string, gmailId: string): void {
-    const r = this.db.prepare("UPDATE outbox SET state = 'sent', gmail_id = ?, sent_at = ?, error = '' WHERE id = ? AND state IN ('sending', 'failed')").run(gmailId, new Date().toISOString(), id);
-    const e = this.outboxGet(id);
-    if (Number(r.changes) && e) this.log(e.itemId, "sent", `${e.kind} ${id} as ${gmailId}`);
+    const before = this.outboxGet(id);
+    if (!before || before.state === "sent") return;
+    this.db.prepare("UPDATE outbox SET state = 'sent', gmail_id = ?, sent_at = ?, error = '' WHERE id = ? AND state != 'sent'").run(gmailId, new Date().toISOString(), id);
+    this.log(before.itemId, "sent", `${before.kind} ${id} as ${gmailId}${before.state !== "sending" ? ` (it went out although it was ${before.state})` : ""}`);
   }
 
-  outboxFailed(id: string, error: string): void {
-    const r = this.db.prepare("UPDATE outbox SET state = 'failed', error = ? WHERE id = ? AND state IN ('sending', 'queued')").run(error, id);
+  /** Marks a send failed, but only by the attempt that took it: an older call can never undo a Retry. */
+  outboxFailed(id: string, error: string, attempt: number): void {
+    const r = this.db.prepare("UPDATE outbox SET state = 'failed', error = ? WHERE id = ? AND state = 'sending' AND attempt = ?").run(error, id, attempt);
+    const e = this.outboxGet(id);
+    if (Number(r.changes) && e) this.log(e.itemId, "send_failed", `${id}: ${error}`);
+  }
+
+  /** A queued send whose time passed long ago (the service was stopped, or the Mac slept): not sent late. */
+  outboxExpire(id: string, error: string): void {
+    const r = this.db.prepare("UPDATE outbox SET state = 'failed', error = ? WHERE id = ? AND state = 'queued'").run(error, id);
     const e = this.outboxGet(id);
     if (Number(r.changes) && e) this.log(e.itemId, "send_failed", `${id}: ${error}`);
   }
@@ -550,10 +574,10 @@ export class Store {
     if (!e) return false;
     const r = this.db
       .prepare(
-        `UPDATE outbox SET state = 'queued', send_at = ?, error = '' WHERE id = ? AND state = 'failed'
+        `UPDATE outbox SET state = 'queued', send_at = ?, queued_at = ?, error = '' WHERE id = ? AND state = 'failed'
          AND NOT EXISTS (SELECT 1 FROM outbox WHERE item_id = ? AND id != ? AND state IN ('queued', 'sending'))`,
       )
-      .run(sendAt, id, e.itemId, id);
+      .run(sendAt, new Date().toISOString(), id, e.itemId, id);
     return Number(r.changes) === 1;
   }
 

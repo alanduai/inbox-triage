@@ -121,13 +121,18 @@ async function runService(): Promise<number> {
     lastPoll = { at: new Date().toISOString(), ok: false, message };
   }
 
+  const server = createServer({ cfg, store, pipeline, vault: vaultWriter(cfg), lastPoll: () => lastPoll, outbox });
+  // The port is the guard against a second copy of the service: it is taken before any queued
+  // send is touched, and a second copy stops here.
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(cfg.dashboard.port, cfg.dashboard.host, resolve);
+  });
+  log(`dashboard on http://${cfg.dashboard.host}:${cfg.dashboard.port}`);
   if (outbox) {
     await outbox.recover().catch((err) => log("could not check sends left from the last run", err));
     log(cfg.sending.enabled ? `sending is on, ${cfg.sending.undoSeconds} seconds to undo` : "sending is off (sending.enabled in config.json)");
   } else if (pipeline) log("sending needs the gmail.modify sign-in: run npm run auth");
-  const server = createServer({ cfg, store, pipeline, vault: vaultWriter(cfg), lastPoll: () => lastPoll, outbox });
-  await new Promise<void>((resolve) => server.listen(cfg.dashboard.port, cfg.dashboard.host, resolve));
-  log(`dashboard on http://${cfg.dashboard.host}:${cfg.dashboard.port}`);
 
   let timer: NodeJS.Timeout | undefined;
   let stopping = false;

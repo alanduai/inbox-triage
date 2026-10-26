@@ -1,6 +1,7 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { LANGUAGES, type Language, type LoadedConfig, type ProjectConfig } from "./config.js";
 import type { GmailReader } from "./gmail/client.js";
+import { isNotFound } from "./gmail/errors.js";
 import { gmailLink } from "./gmail/links.js";
 import { isNoiseAttachment, quotedRest, type ParsedMessage } from "./gmail/parse.js";
 import { ThreadNotes } from "./notes.js";
@@ -23,12 +24,6 @@ const OVERLAP_SECONDS = 7 * 86_400;
 /** A reply of yours: sent, not a draft or a scheduled message. */
 function isSentReply(labelIds: string[]): boolean {
   return labelIds.includes("SENT") && !labelIds.includes("DRAFT") && !labelIds.includes("SCHEDULED");
-}
-
-/** Gmail's answer for a message that no longer exists, for example one you deleted. */
-function isNotFound(err: unknown): boolean {
-  const e = err as { status?: unknown; response?: { status?: unknown } } | null;
-  return e?.status === 404 || e?.response?.status === 404;
 }
 
 const DELETED_BEFORE_TRIAGE = "The message was deleted in Gmail before Claude read it. The note keeps the text as it arrived.";
@@ -434,13 +429,17 @@ export class Pipeline {
       // An acknowledgement from the dashboard is a holding reply: it closes nothing. It is known by
       // its Gmail id, or by its outbox id while that is still being recorded.
       const acks = new Set(this.store.ackGmailIds(threadId));
-      const isAck = (m: { id: string; ref?: string }) => acks.has(m.id) || (Boolean(m.ref) && this.store.outboxGet(m.ref!)?.kind === "ack");
-      const sent = meta.filter((m) => isSentReply(m.labelIds) && !isAck(m));
+      const outboxOf = (m: { ref?: string }) => (m.ref ? this.store.outboxGet(m.ref) : null);
+      const sent = meta
+        .filter((m) => isSentReply(m.labelIds) && !acks.has(m.id) && outboxOf(m)?.kind !== "ack")
+        // A reply sent from the dashboard answers what was there when you pressed Send, not mail
+        // that arrived during the Undo window or before it went out.
+        .map((m) => ({ ...m, answeredAt: outboxOf(m)?.queuedAt ? new Date(outboxOf(m)!.queuedAt).getTime() : m.internalDate.getTime() }));
       for (const item of this.store.openInThread(threadId)) {
         // A reply closes what asked for a reply; a task without a reply (needs_action) waits for you.
         if (item.status === "pending_triage" || item.status === "needs_action") continue;
         const after = Math.max(new Date(item.receivedAt).getTime(), item.reopenedAt ? new Date(item.reopenedAt).getTime() : 0);
-        if (sent.some((m) => m.internalDate.getTime() > after && answers(m.recipients, item))) {
+        if (sent.some((m) => m.answeredAt > after && answers(m.recipients, item))) {
           this.setStatus(item.id, "replied", "reply found in Gmail");
           closed++;
         }

@@ -300,8 +300,12 @@ class FakeSender {
   failSend: "before" | "after" | null = null;
   failFind = 0;
   failArchive = 0;
+  archiveGone = false;
+  // A send held mid-call until released, as a slow Gmail would.
+  hold: Promise<void> | null = null;
   constructor(private readonly onSent: (m: Meta) => void) {}
   async send(raw: string, threadId: string): Promise<string> {
+    if (this.hold) await this.hold;
     if (this.failSend === "before") {
       this.failSend = null;
       throw new Error("ETIMEDOUT");
@@ -325,6 +329,7 @@ class FakeSender {
     return this.sent.find((s) => s.threadId === threadId && decodeRaw(s.raw).headers[OUTBOX_HEADER.toLowerCase()] === outboxId)?.id ?? null;
   }
   async archiveUpTo(threadId: string, upTo: Date): Promise<void> {
+    if (this.archiveGone) throw Object.assign(new Error("Not Found"), { status: 404 });
     if (this.failArchive > 0) {
       this.failArchive--;
       throw new Error("Gmail 500");
@@ -357,9 +362,13 @@ function harness(cfgOverrides: Record<string, unknown> = {}) {
   const store = new Store(":memory:");
   const msgs = new Map<string, ParsedMessage>();
   const meta: Meta[] = [];
+  const gone = new Set<string>();
   const gmail = {
     listIds: async () => ({ ids: [...msgs.keys()], truncated: false }),
-    message: async (id: string) => msgs.get(id)!,
+    message: async (id: string) => {
+      if (gone.has(id)) throw Object.assign(new Error("Requested entity was not found."), { status: 404 });
+      return msgs.get(id)!;
+    },
     thread: async (id: string) => [...msgs.values()].filter((m) => m.threadId === id),
     threadMeta: async (id: string) => [
       ...[...msgs.values()].filter((m) => m.threadId === id).map((m) => ({ id: m.id, internalDate: m.internalDate, labelIds: m.labelIds, fromEmail: m.from.email, recipients: [], ref: "" })),
@@ -376,7 +385,7 @@ function harness(cfgOverrides: Record<string, unknown> = {}) {
   const sender = new FakeSender((m) => meta.push(m));
   const outbox = new Outbox({ cfg, store, reader: gmail as unknown as GmailReader, sender: sender as unknown as GmailSender, notes: pipeline.notes });
   return {
-    cfg, store, pipeline, sender, outbox, vault, answers, meta,
+    cfg, store, pipeline, sender, outbox, vault, answers, meta, gone, gmail,
     add: (m: ParsedMessage) => msgs.set(m.id, m),
     note: (rel: string) => fs.readFileSync(path.join(vaultDir, rel), "utf8"),
     /** Ends the Undo window of every queued send now. */
@@ -495,7 +504,8 @@ test("outbox: after a restart, a send left long in the queue waits for Retry, an
   const stale = h.outbox.queue(h.store.get("1a")!, "reply", ["marija@bank.example"], [], "Hvala.");
   h.store.db.prepare("UPDATE outbox SET send_at = ? WHERE id = ?").run(new Date(Date.now() - 20 * 60_000).toISOString(), stale.id);
   const cut = h.outbox.queue(h.store.get("1b")!, "reply", ["ivan@bank.example"], [], "Hvala.");
-  h.store.db.prepare("UPDATE outbox SET state = 'sending', attempt_at = ? WHERE id = ?").run(new Date().toISOString(), cut.id);
+  // Cut off by the stop two minutes ago, so no call of it can still be running.
+  h.store.db.prepare("UPDATE outbox SET state = 'sending', attempt = 1, attempt_at = ? WHERE id = ?").run(new Date(Date.now() - 120_000).toISOString(), cut.id);
   const restarted = new Outbox({ cfg: h.cfg, store: h.store, reader: (h.outbox as unknown as { deps: { reader: GmailReader } }).deps.reader, sender: h.sender as unknown as GmailSender, notes: h.pipeline.notes });
   await restarted.recover();
   await restarted.tick();
@@ -639,4 +649,142 @@ test("server: sending off blocks Send but not a Gmail draft; brackets and acknow
   } finally {
     on.server.close();
   }
+});
+
+// ---------- state-machine review findings ----------
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+test("SM-1: a second copy settling a send that is still in flight never causes a second send", async () => {
+  const h = harness();
+  h.add(msg({ id: "1a", thread: "t1", from: "Marija <marija@bank.example>", at: T0 }));
+  await h.pipeline.pollOnce();
+  const e = h.outbox.queue(h.store.get("1a")!, "reply", ["marija@bank.example"], [], "Hvala.");
+  let release!: () => void;
+  h.sender.hold = new Promise<void>((r) => (release = r));
+  h.due();
+  const inFlight = h.outbox.tick();
+  await sleep(5);
+  const b = new Outbox({ cfg: h.cfg, store: h.store, reader: h.gmail as unknown as GmailReader, sender: h.sender as unknown as GmailSender, notes: h.pipeline.notes });
+  await b.recover();
+  assert.equal(h.store.outboxGet(e.id)!.state, "sending", "a fresh call is not looked up by another copy");
+  // Even if the other copy decides it failed (the call is slow) and you press Retry...
+  h.store.db.prepare("UPDATE outbox SET attempt_at = ? WHERE id = ?").run(new Date(Date.now() - 120_000).toISOString(), e.id);
+  await b.maintain();
+  assert.equal(h.store.outboxGet(e.id)!.state, "failed");
+  await b.retry(e.id);
+  // ...when the first call lands, it counts as sent, and nothing goes again.
+  h.sender.hold = null;
+  release();
+  await inFlight;
+  assert.equal(h.store.outboxGet(e.id)!.state, "sent");
+  h.due();
+  await h.outbox.tick();
+  await b.tick();
+  assert.equal(h.sender.sent.length, 1);
+});
+
+test("SM-2: mail that arrives while your reply waits to go is neither closed nor archived by it", async () => {
+  const h = harness();
+  h.add(msg({ id: "1a", thread: "t1", from: "Marija <marija@bank.example>", at: T0 }));
+  await h.pipeline.pollOnce();
+  const first = h.store.get("1a")!;
+  h.outbox.queue(first, "reply", ["marija@bank.example"], [], "Hvala.");
+  await sleep(5);
+  h.add(msg({ id: "1b", thread: "t1", from: "Marija <marija@bank.example>", subject: "Re: Dokumenti", at: Date.now() }));
+  await sleep(5);
+  await h.pipeline.pollOnce();
+  h.due();
+  await h.outbox.tick();
+  await h.pipeline.pollOnce();
+  assert.equal(h.store.get("1a")!.status, "replied");
+  assert.equal(h.store.get("1b")!.status, "needs_reply", "the newer message still needs you");
+  assert.deepEqual(h.sender.archived, [{ threadId: "t1", upTo: first.receivedAt }]);
+});
+
+test("SM-3: after Retry, the Undo countdown is the Undo window again, not the time since the first try", async () => {
+  const h = harness();
+  h.add(msg({ id: "1a", from: "Marija <marija@bank.example>", at: T0 }));
+  await h.pipeline.pollOnce();
+  const e = h.outbox.queue(h.store.get("1a")!, "reply", ["marija@bank.example"], [], "Hvala.");
+  h.store.db.prepare("UPDATE outbox SET created_at = ?, queued_at = ? WHERE id = ?").run(new Date(Date.now() - 3_600_000).toISOString(), new Date(Date.now() - 3_600_000).toISOString(), e.id);
+  h.sender.failSend = "before";
+  h.due();
+  await h.outbox.tick();
+  const again = await h.outbox.retry(e.id);
+  const window = new Date(again.sendAt).getTime() - new Date(again.queuedAt).getTime();
+  assert.ok(window >= 4_900 && window <= 5_100, `window ${window} ms`);
+});
+
+test("SM-4: a reply confirmed late never closes a message you put back in the queue meanwhile", async () => {
+  const h = harness();
+  h.add(msg({ id: "1a", thread: "t1", from: "Marija <marija@bank.example>", at: T0 }));
+  await h.pipeline.pollOnce();
+  const e = h.outbox.queue(h.store.get("1a")!, "reply", ["marija@bank.example"], [], "Hvala.");
+  h.sender.failSend = "after";
+  h.sender.failFind = 1;
+  h.due();
+  await h.outbox.tick();
+  assert.equal(h.store.outboxGet(e.id)!.state, "sending");
+  await h.pipeline.pollOnce();
+  assert.equal(h.store.get("1a")!.status, "replied", "the poll sees your reply in Gmail");
+  await sleep(5);
+  h.pipeline.setStatus("1a", "needs_reply", "set in dashboard");
+  h.store.db.prepare("UPDATE outbox SET attempt_at = ? WHERE id = ?").run(new Date(Date.now() - 120_000).toISOString(), e.id);
+  // Keep the original press time: the reopen came after it.
+  await h.outbox.maintain();
+  assert.equal(h.store.outboxGet(e.id)!.state, "sent");
+  assert.equal(h.store.get("1a")!.status, "needs_reply");
+});
+
+test("SM-5: a reply to a message not filed yet is added to its note once the note exists", async () => {
+  const h = harness();
+  h.vault.failWrites = 999;
+  h.add(msg({ id: "1a", thread: "t1", from: "Marija <marija@bank.example>", at: T0 }));
+  await h.pipeline.pollOnce();
+  assert.equal(h.store.get("1a")!.notePath, "");
+  const it = h.store.get("1a")!;
+  const e = h.outbox.queue(it, "ack", ["marija@bank.example"], [], it.triage!.ack_reply);
+  h.due();
+  await h.outbox.tick();
+  assert.equal(h.store.outboxGet(e.id)!.state, "sent");
+  h.vault.failWrites = 0;
+  await h.pipeline.pollOnce();
+  await h.outbox.maintain();
+  const note = h.note(h.store.get("1a")!.notePath);
+  assert.equal(note.match(/You acknowledged/g)?.length, 1);
+  assert.equal(h.store.outboxGet(e.id)!.effects, EFFECTS_ALL);
+});
+
+test("SM-7: a message deleted in Gmail fails its send at once, and a deleted thread ends the archive step", async () => {
+  const h = harness();
+  h.add(msg({ id: "1a", thread: "t1", from: "Marija <marija@bank.example>", at: T0 }));
+  h.add(msg({ id: "1b", thread: "t2", from: "Ivan <ivan@bank.example>", at: T0 }));
+  await h.pipeline.pollOnce();
+  const e = h.outbox.queue(h.store.get("1a")!, "reply", ["marija@bank.example"], [], "Hvala.");
+  h.gone.add("1a");
+  h.due();
+  await h.outbox.tick();
+  assert.equal(h.store.outboxGet(e.id)!.state, "failed");
+  assert.match(h.store.outboxGet(e.id)!.error, /deleted in Gmail/);
+  // A new reply to the message is possible again (nothing is stuck).
+  assert.ok(h.outbox.queue(h.store.get("1a")!, "reply", ["marija@bank.example"], [], "Hvala."));
+  const f = h.outbox.queue(h.store.get("1b")!, "reply", ["ivan@bank.example"], [], "Hvala.");
+  h.sender.archiveGone = true;
+  h.store.db.prepare("UPDATE outbox SET send_at = ? WHERE id = ?").run(new Date(Date.now() - 1000).toISOString(), f.id);
+  await h.outbox.tick();
+  assert.equal(h.store.outboxGet(f.id)!.state, "sent");
+  assert.equal(h.store.outboxGet(f.id)!.effects, EFFECTS_ALL);
+});
+
+test("SM-8: a send long overdue after the Mac slept is not sent late, without any restart", async () => {
+  const h = harness();
+  h.add(msg({ id: "1a", from: "Marija <marija@bank.example>", at: T0 }));
+  await h.pipeline.pollOnce();
+  const e = h.outbox.queue(h.store.get("1a")!, "reply", ["marija@bank.example"], [], "Hvala.");
+  h.store.db.prepare("UPDATE outbox SET send_at = ? WHERE id = ?").run(new Date(Date.now() - 2 * 3_600_000).toISOString(), e.id);
+  await h.outbox.tick();
+  assert.equal(h.sender.sent.length, 0);
+  assert.equal(h.store.outboxGet(e.id)!.state, "failed");
+  assert.match(h.store.outboxGet(e.id)!.error, /Press Retry/);
 });

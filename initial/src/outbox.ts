@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { LoadedConfig } from "./config.js";
 import type { GmailReader } from "./gmail/client.js";
+import { isNotFound } from "./gmail/errors.js";
 import { buildReply, toRaw, withQuote, type MailAddress } from "./gmail/mime.js";
 import type { GmailSender } from "./gmail/sender.js";
 import type { ParsedMessage } from "./gmail/parse.js";
@@ -10,8 +11,8 @@ import { cleanRecipients } from "./sending.js";
 import { EFFECT_ARCHIVE, EFFECT_NOTE, EFFECT_STATUS, type Item, type OutboxEntry, type Store } from "./store/db.js";
 import { log } from "./util/time.js";
 
-// A send still queued this long after its Undo window ended (the service was stopped) is not sent
-// late on its own: it waits for you to press Retry.
+// A send still queued this long after its Undo window ended (the service was stopped, or the Mac
+// slept) is not sent late on its own: it waits for you to press Retry.
 const STALE_MS = 10 * 60_000;
 // A send whose Gmail call started this long ago, with no answer recorded, is checked in Gmail.
 const UNCERTAIN_MS = 60_000;
@@ -65,7 +66,13 @@ export class Outbox {
     if (!e || e.state !== "failed") throw new OutboxError("Only a send that failed can be retried.");
     const item = store.get(e.itemId);
     if (!item) throw new OutboxError("The message is no longer in the store.");
-    const found = await this.deps.sender.findSent(item.threadId, e.id);
+    let found: string | null = null;
+    try {
+      found = await this.deps.sender.findSent(item.threadId, e.id);
+    } catch (err) {
+      // A thread deleted for good holds nothing of ours; the send then fails on its own, clearly.
+      if (!isNotFound(err)) throw err;
+    }
     if (found) {
       store.outboxSent(e.id, found);
       await this.finish(store.outboxGet(e.id)!);
@@ -77,20 +84,19 @@ export class Outbox {
     return store.outboxGet(id)!;
   }
 
-  /** At start: sends left waiting while the service was stopped, and Gmail calls cut off by a stop. */
+  /**
+   * At start: sends left waiting too long are not sent late, and Gmail calls cut off by a stop
+   * are looked up once they are old enough that no other call can still be running.
+   */
   async recover(): Promise<void> {
-    const { store } = this.deps;
-    const now = Date.now();
-    for (const e of store.outboxInState("queued")) {
-      if (now - new Date(e.sendAt).getTime() > STALE_MS) {
-        store.outboxFailed(e.id, "Not sent: the service was stopped before it went out. Press Retry to send it now.");
-      }
-    }
-    await this.reconcile(0);
+    this.expireStale();
+    await this.reconcile(UNCERTAIN_MS);
   }
 
   /** Sends whose Undo window has passed. Called every second by the service. */
   async tick(): Promise<void> {
+    // After the Mac slept, or the service was stopped, a send that is long overdue waits for Retry.
+    this.expireStale();
     for (const e of this.deps.store.outboxDue(new Date().toISOString())) await this.deliver(e);
   }
 
@@ -100,29 +106,46 @@ export class Outbox {
     for (const e of this.deps.store.outboxUnfinished()) await this.finish(e);
   }
 
+  private expireStale(): void {
+    const now = Date.now();
+    for (const e of this.deps.store.outboxInState("queued")) {
+      if (now - new Date(e.sendAt).getTime() > STALE_MS) {
+        this.deps.store.outboxExpire(e.id, "Not sent: it was due long ago (the service was stopped or the Mac was asleep). Press Retry to send it now.");
+      }
+    }
+  }
+
   private async deliver(e: OutboxEntry): Promise<void> {
     const { store, reader, sender } = this.deps;
-    if (!store.outboxClaim(e.id)) return;
+    const attempt = store.outboxClaim(e.id);
+    if (!attempt) return;
     this.inFlight.add(e.id);
     const item = store.get(e.itemId);
+    // Until the send call starts, a failure means nothing went out.
+    let handedToGmail = false;
     try {
       if (!item) throw new Error("the message is no longer in the store");
       // Read before sending: Message-ID and References keep the reply in the thread.
       const original = await reader.message(item.id);
       const raw = toRaw(this.message(item, original, e));
+      handedToGmail = true;
       const gmailId = await sender.send(raw, item.threadId);
       store.outboxSent(e.id, gmailId);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = isNotFound(err) ? "the message or its thread was deleted in Gmail" : err instanceof Error ? err.message : String(err);
       log(`send ${e.id} failed or timed out`, err);
-      // The call may have reached Gmail before it failed: look before calling it failed.
-      try {
-        const found = item ? await sender.findSent(item.threadId, e.id) : null;
-        if (found) store.outboxSent(e.id, found);
-        else store.outboxFailed(e.id, `Not sent: ${message}`);
-      } catch (checkErr) {
-        // Outcome unknown: it stays "sending" and is checked again in a minute.
-        store.outboxNote(e.id, `Checking whether it went out: ${checkErr instanceof Error ? checkErr.message : String(checkErr)}`);
+      if (!handedToGmail || !item) store.outboxFailed(e.id, `Not sent: ${message}`, attempt);
+      else {
+        // The call may have reached Gmail before it failed: look before calling it failed.
+        try {
+          const found = await sender.findSent(item.threadId, e.id);
+          if (found) store.outboxSent(e.id, found);
+          else store.outboxFailed(e.id, `Not sent: ${message}`, attempt);
+        } catch (checkErr) {
+          if (isNotFound(checkErr)) store.outboxFailed(e.id, "Not sent: the thread was deleted in Gmail.", attempt);
+          // Outcome unknown: it stays "sending" and is checked again in a minute.
+          else store.outboxNote(e.id, `Checking whether it went out: ${checkErr instanceof Error ? checkErr.message : String(checkErr)}`);
+        }
       }
     } finally {
       this.inFlight.delete(e.id);
@@ -139,7 +162,7 @@ export class Outbox {
       if (Date.now() - new Date(e.attemptAt ?? e.sendAt).getTime() < minAgeMs) continue;
       const item = store.get(e.itemId);
       if (!item) {
-        store.outboxFailed(e.id, "Not sent: the message is no longer in the store.");
+        store.outboxFailed(e.id, "Not sent: the message is no longer in the store.", e.attempt);
         continue;
       }
       try {
@@ -147,9 +170,10 @@ export class Outbox {
         if (found) {
           store.outboxSent(e.id, found);
           await this.finish(store.outboxGet(e.id)!);
-        } else store.outboxFailed(e.id, `Not sent${e.error ? ` (${e.error})` : ""}. Press Retry to send it.`);
+        } else store.outboxFailed(e.id, `Not sent${e.error ? ` (${e.error})` : ""}. Press Retry to send it.`, e.attempt);
       } catch (err) {
-        store.outboxNote(e.id, `Checking whether it went out: ${err instanceof Error ? err.message : String(err)}`);
+        if (isNotFound(err)) store.outboxFailed(e.id, "Not sent: the thread was deleted in Gmail.", e.attempt);
+        else store.outboxNote(e.id, `Checking whether it went out: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   }
@@ -160,9 +184,12 @@ export class Outbox {
     const item = store.get(e.itemId);
     if (!item) return;
     if (!(e.effects & EFFECT_STATUS)) {
-      // A reply answers the message; an acknowledgement is a holding reply, so it stays open.
-      if (e.kind === "reply") notes.setStatus(item.id, "replied", "sent from the dashboard");
-      else {
+      // A reply answers the message, unless you put it back in the queue after pressing Send;
+      // an acknowledgement is a holding reply, so the message stays open.
+      const pressed = new Date(e.attemptAt ?? e.queuedAt).getTime();
+      const reopenedSince = item.reopenedAt !== null && new Date(item.reopenedAt).getTime() > pressed;
+      if (e.kind === "reply" && !reopenedSince) notes.setStatus(item.id, "replied", "sent from the dashboard");
+      else if (e.kind === "ack") {
         store.setAcked(item.id, e.sentAt ?? new Date().toISOString());
         notes.sync(item.threadId, item.projectId);
       }
@@ -171,10 +198,12 @@ export class Outbox {
     if (!(e.effects & EFFECT_NOTE) && notes.recordSent(item, e)) store.addEffects(e.id, EFFECT_NOTE);
     if (!(e.effects & EFFECT_ARCHIVE)) {
       try {
+        // The answered message and older ones only: mail that came later stays in the inbox.
         await sender.archiveUpTo(item.threadId, new Date(item.receivedAt));
         store.addEffects(e.id, EFFECT_ARCHIVE);
       } catch (err) {
-        log(`could not archive thread ${item.threadId} yet`, err);
+        if (isNotFound(err)) store.addEffects(e.id, EFFECT_ARCHIVE);
+        else log(`could not archive thread ${item.threadId} yet`, err);
       }
     }
   }
@@ -206,7 +235,7 @@ export class Outbox {
     const original = await this.deps.reader.message(item.id);
     const e: OutboxEntry = {
       id: `draft-${randomUUID()}`, itemId: item.id, kind: "reply", to: cleanRecipients(to), cc: cleanRecipients(cc), body,
-      state: "queued", sendAt: "", createdAt: "", attemptAt: null, gmailId: null, sentAt: null, error: "", effects: 0,
+      state: "queued", sendAt: "", createdAt: "", queuedAt: "", attempt: 0, attemptAt: null, gmailId: null, sentAt: null, error: "", effects: 0,
     };
     const id = await this.deps.sender.createDraft(toRaw(this.message(item, original, e)), item.threadId);
     this.deps.store.log(item.id, "gmail_draft", id);

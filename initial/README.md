@@ -39,9 +39,10 @@ Each message shows its reply with **To** and **Cc** filled in, ready to edit.
 **Who it goes to.** Replies go to everyone by default, as Reply all in Gmail: the sender (or their Reply-To on the same domain) and the original To in **To**, the original Cc in **Cc**, never your own addresses. Mail from the court or the other side is the exception: the reply goes to your own lawyer alone, with the court's letter quoted, because Reply all would copy the court and the other side.
 
 **What you can do:**
-- **Send.** The reply goes into the same Gmail thread, with the original quoted below your text, from your Gmail address.
+- **Send.** The reply goes into the same Gmail thread from your Gmail address, with the original quoted below your text. The quote is introduced by the sender's address, never their display name, which anyone can set.
   - For the configured number of seconds (5 by default) an **Undo** bar shows; Undo means nothing was sent.
-  - Afterwards the item is **Replied**, your reply is added to the thread's note ("You replied"), and the thread is marked read and archived in Gmail. Superhuman follows Gmail.
+  - Afterwards the item is **Replied**, and your reply is added to the thread's note ("You replied").
+  - The message you answered, and older ones in the thread, are marked read and archived in Gmail. Superhuman follows Gmail. Anything that arrived in the thread after it stays unread in your inbox.
 - **Send acknowledgement.** Sends Claude's short holding reply, sign-off included. The message stays in your queue, marked **Acknowledged**, until the real reply goes out. It is not offered for the court, the other side or an unverified sender.
 - **Save as Gmail draft.** Puts the reply in the thread as a draft, to finish in Gmail or Superhuman. Nothing is sent; the item closes once you send it from there.
 - **Copy reply**, as in phase 1.
@@ -56,10 +57,15 @@ Each message shows its reply with **To** and **Cc** filled in, ready to edit.
   The confirmation covers exactly what you saw: change a word or a recipient and it asks again.
 - One send per message at a time.
 
+**A reply answers what was there when you pressed Send.** A message that arrives in the thread during the Undo window stays open in the dashboard and unread in your inbox.
+
 **If something goes wrong:**
-- **A send that fails** is shown as **Not sent**, with the reason and a **Retry** button. It is never sent again on its own.
-- **A send whose outcome is unknown** (the connection dropped as Gmail took it) is looked up in the thread by its own id before it is ever called failed, so it is not sent twice.
-- **A send still waiting when the service stopped** is not sent late on its own: after a restart it waits for Retry.
+- **A send that fails** is shown as **Not sent**, with the reason and a **Retry** button. It is never sent again on its own. Retry gives you a fresh Undo window.
+- **A send whose outcome is unknown** (the connection dropped as Gmail took it) is looked up in the thread by its own reference before it is ever called failed, so it is not sent twice. If Gmail confirms it later, it counts as sent, whatever happened meanwhile.
+- **A send more than 10 minutes overdue** (the service was stopped, or the Mac slept) is not sent late on its own: it waits for Retry.
+- **A message deleted in Gmail** before its reply went out: the send fails at once, with the reason.
+- **Only one copy of the service sends.** A second copy started by mistake stops before it touches anything, because the dashboard's port is taken.
+- **Every Gmail call gives up after a minute**, so one that hangs never stops the others.
 
 ### The notes
 
@@ -155,7 +161,7 @@ npm run send-test     # two messages to yourself, then archived
 
 The test checks, on your real account:
 - that a reply stays in its thread;
-- that the app's own header survives, so a retry can tell whether a send already went out;
+- that the reply's reference header survives, so a retry can tell whether a send already went out (it is a random value under a neutral name: recipients cannot tell how the reply was written);
 - that a subject with č, ć, š, ž, đ, å, ä and ö comes back intact;
 - that mark read and archive work.
 

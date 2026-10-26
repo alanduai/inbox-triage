@@ -1,5 +1,6 @@
 import { gmail, type gmail_v1 } from "@googleapis/gmail";
 import type { OAuth2Client } from "google-auth-library";
+import { GMAIL_TIMEOUT_MS } from "./errors.js";
 import { OUTBOX_HEADER } from "./mime.js";
 
 /** The Gmail calls that change something: send, save a draft, mark read and archive. Needs gmail.modify. */
@@ -12,13 +13,13 @@ export class GmailSender {
 
   /** Sends a raw message into an existing thread; returns the new message's id. */
   async send(raw: string, threadId: string): Promise<string> {
-    const res = await this.api.users.messages.send({ userId: "me", requestBody: { raw, threadId } });
+    const res = await this.api.users.messages.send({ userId: "me", requestBody: { raw, threadId } }, { timeout: GMAIL_TIMEOUT_MS });
     return res.data.id ?? "";
   }
 
   /** Saves a raw message as a draft in the thread, for you to finish in Gmail or Superhuman. */
   async createDraft(raw: string, threadId: string): Promise<string> {
-    const res = await this.api.users.drafts.create({ userId: "me", requestBody: { message: { raw, threadId } } });
+    const res = await this.api.users.drafts.create({ userId: "me", requestBody: { message: { raw, threadId } } }, { timeout: GMAIL_TIMEOUT_MS });
     return res.data.id ?? "";
   }
 
@@ -28,18 +29,18 @@ export class GmailSender {
    * were replying is never hidden.
    */
   async archiveUpTo(threadId: string, upTo: Date): Promise<void> {
-    const res = await this.api.users.threads.get({ userId: "me", id: threadId, format: "minimal" });
+    const res = await this.api.users.threads.get({ userId: "me", id: threadId, format: "minimal" }, { timeout: GMAIL_TIMEOUT_MS });
     const ids = (res.data.messages ?? [])
       .filter((m) => Number(m.internalDate ?? 0) <= upTo.getTime())
       .filter((m) => (m.labelIds ?? []).some((l) => l === "INBOX" || l === "UNREAD"))
       .map((m) => m.id ?? "")
       .filter(Boolean);
-    if (ids.length) await this.api.users.messages.batchModify({ userId: "me", requestBody: { ids, removeLabelIds: ["INBOX", "UNREAD"] } });
+    if (ids.length) await this.api.users.messages.batchModify({ userId: "me", requestBody: { ids, removeLabelIds: ["INBOX", "UNREAD"] } }, { timeout: GMAIL_TIMEOUT_MS });
   }
 
   /** The id of a sent message in the thread that carries this outbox id, if one went out. */
   async findSent(threadId: string, outboxId: string): Promise<string | null> {
-    const res = await this.api.users.threads.get({ userId: "me", id: threadId, format: "metadata", metadataHeaders: [OUTBOX_HEADER] });
+    const res = await this.api.users.threads.get({ userId: "me", id: threadId, format: "metadata", metadataHeaders: [OUTBOX_HEADER] }, { timeout: GMAIL_TIMEOUT_MS });
     for (const m of res.data.messages ?? []) {
       const labels = m.labelIds ?? [];
       if (!labels.includes("SENT") || labels.includes("DRAFT")) continue;
@@ -51,7 +52,7 @@ export class GmailSender {
 
   /** Headers of one message as Gmail stored them, for the send test. */
   async headers(messageId: string, names: string[]): Promise<Record<string, string>> {
-    const res = await this.api.users.messages.get({ userId: "me", id: messageId, format: "metadata", metadataHeaders: names });
+    const res = await this.api.users.messages.get({ userId: "me", id: messageId, format: "metadata", metadataHeaders: names }, { timeout: GMAIL_TIMEOUT_MS });
     const out: Record<string, string> = {};
     for (const h of res.data.payload?.headers ?? []) if (h.name) out[h.name.toLowerCase()] = h.value ?? "";
     out["x-thread-id"] = res.data.threadId ?? "";
@@ -60,7 +61,7 @@ export class GmailSender {
 
   /** Sends a raw message that starts a new thread (the send test only). */
   async sendNew(raw: string): Promise<{ id: string; threadId: string }> {
-    const res = await this.api.users.messages.send({ userId: "me", requestBody: { raw } });
+    const res = await this.api.users.messages.send({ userId: "me", requestBody: { raw } }, { timeout: GMAIL_TIMEOUT_MS });
     return { id: res.data.id ?? "", threadId: res.data.threadId ?? "" };
   }
 }

@@ -157,7 +157,8 @@ export class ThreadNotes {
   recordSent(item: Item, sent: OutboxEntry): boolean {
     try {
       const notePath = this.noteFor(item.threadId, item.projectId);
-      if (!notePath) return true;
+      // Not filed yet: wait for the note. A note you deleted stays deleted.
+      if (!notePath) return this.store.threadItems(item.threadId, item.projectId).some((i) => i.notePath);
       const content = this.vault.read(notePath);
       if (new RegExp(`\\^${sentBlockId(sent.id)}[ \\t]*$`, "m").test(content)) return true;
       const stamp = localStamp(new Date(sent.sentAt ?? Date.now()), this.cfg.tz);

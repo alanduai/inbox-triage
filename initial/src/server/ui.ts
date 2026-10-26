@@ -419,10 +419,10 @@ dialog.confirm p { margin: 4px 0; overflow-wrap: anywhere; }
     $("confirm-cancel").onclick = function () { dlg.close(); toast("Not sent."); };
     dlg.showModal();
   }
-  // Undo: the countdown follows the server's window, measured from when the server queued it.
+  // Undo: the countdown follows the server's window, measured from when you pressed Send or Retry.
   var U = { id: null, item: null, until: 0, timer: null };
   function startUndo(e, itemId) {
-    U.id = e.id; U.item = itemId; U.until = Date.now() + Math.max(0, new Date(e.sendAt).getTime() - new Date(e.createdAt).getTime());
+    U.id = e.id; U.item = itemId; U.until = Date.now() + Math.max(0, new Date(e.sendAt).getTime() - new Date(e.queuedAt || e.createdAt).getTime());
     $("undo").hidden = false; tickUndo();
     if (S.sel === itemId) loadDetail(itemId);
   }
@@ -441,7 +441,7 @@ dialog.confirm p { margin: 4px 0; overflow-wrap: anywhere; }
   function watchSend(id, itemId, n) {
     api("GET", "/api/outbox/" + id).then(function (e) {
       if ((e.state === "queued" || e.state === "sending") && n < 40) { setTimeout(function () { watchSend(id, itemId, n + 1); }, 750); return; }
-      toast(e.state === "sent" ? (e.kind === "ack" ? "Acknowledgement sent. The message stays in your queue for the real reply." : "Sent. The thread is marked read and archived in Gmail.")
+      toast(e.state === "sent" ? (e.kind === "ack" ? "Acknowledgement sent. The message stays in your queue for the real reply." : "Sent. Marked read and archived in Gmail.")
         : e.state === "failed" ? "Not sent: " + e.error : "Still sending. Check again in a moment.");
       refresh(); if (S.sel === itemId) loadDetail(itemId);
     }).catch(function (err) { toast(err.message); });
