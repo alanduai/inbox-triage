@@ -5,10 +5,13 @@ import path from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { dataPath, defaultConfigPath, loadConfig, type LoadedConfig } from "./config.js";
 import { doctor, printReport } from "./doctor.js";
-import { authorizedClient, runAuthFlow } from "./gmail/auth.js";
+import { authorizedClient, runAuthFlow, tokenCanSend } from "./gmail/auth.js";
 import { GmailReader } from "./gmail/client.js";
+import { GmailSender } from "./gmail/sender.js";
 import { VaultWriter } from "./obsidian/writer.js";
+import { Outbox } from "./outbox.js";
 import { Pipeline } from "./pipeline.js";
+import { sendTest } from "./sendtest.js";
 import { createServer } from "./server/server.js";
 import { Store } from "./store/db.js";
 import { anthropicApiKey } from "./util/secrets.js";
@@ -19,6 +22,7 @@ const HELP = `inbox-triage <command>
   init              create config.json from the example and the private data folder
   auth              sign in to Gmail (read-only) and store the token
   doctor [--online] check the setup on this machine; --online also tests Gmail and Claude
+  send-test         send two test messages to yourself and check threading, headers and encoding
   poll              check Gmail once, triage and file new messages, then exit
   run               start the dashboard and check Gmail every few minutes (the service)
   token             print a new dashboard token, for access from your network
@@ -32,11 +36,15 @@ function vaultWriter(cfg: LoadedConfig): VaultWriter {
   return new VaultWriter(cfg.vault.path, cfg.vault.maxSyncFileMB * 1_000_000, dataPath(cfg, cfg.vault.largeAttachmentDir));
 }
 
-function makePipeline(cfg: LoadedConfig, store: Store): Pipeline {
+function makePipeline(cfg: LoadedConfig, store: Store): { pipeline: Pipeline; outbox: Outbox | null } {
   if (!fs.existsSync(cfg.vault.path)) throw new Error(`Vault not found at ${cfg.vault.path}`);
-  const gmail = new GmailReader(authorizedClient(cfg));
+  const auth = authorizedClient(cfg);
+  const gmail = new GmailReader(auth);
   const claude = new Anthropic({ apiKey: anthropicApiKey(cfg) });
-  return new Pipeline(cfg, store, gmail, claude, vaultWriter(cfg));
+  const pipeline = new Pipeline(cfg, store, gmail, claude, vaultWriter(cfg));
+  // A read-only (phase 1) sign-in reads as before; the dashboard says sending needs npm run auth.
+  const outbox = tokenCanSend(cfg) ? new Outbox({ cfg, store, reader: gmail, sender: new GmailSender(auth), notes: pipeline.notes }) : null;
+  return { pipeline, outbox };
 }
 
 async function main(argv: string[]): Promise<number> {
@@ -72,12 +80,24 @@ async function main(argv: string[]): Promise<number> {
       const cfg = loadConfig();
       const store = openStore(cfg);
       try {
-        const r = await makePipeline(cfg, store).pollOnce();
+        const r = await makePipeline(cfg, store).pipeline.pollOnce();
         console.log(`matched ${r.matched}, filed ${r.ingested}, finished earlier ones ${r.refiled}, failed ${r.failed}, closed by your replies ${r.closedByReply}`);
         return r.failed ? 1 : 0;
       } finally {
         store.close();
       }
+    }
+    case "send-test": {
+      const cfg = loadConfig();
+      if (!tokenCanSend(cfg)) {
+        console.log("The Gmail sign-in is read-only. Run npm run auth to allow sending, then try again.");
+        return 1;
+      }
+      const steps = await sendTest(cfg, new GmailSender(authorizedClient(cfg)));
+      for (const s of steps) console.log(`${s.ok ? "✓" : "✗"} ${s.name}: ${s.detail}`);
+      const ok = steps.every((s) => s.ok);
+      console.log(ok ? "\nAll good. To send from the dashboard, set sending.enabled to true in config.json and restart the service." : "\nSomething did not work: keep sending off and send me the lines above.");
+      return ok ? 0 : 1;
     }
     case "run":
       return runService();
@@ -91,16 +111,21 @@ async function runService(): Promise<number> {
   const cfg = loadConfig();
   const store = openStore(cfg);
   let pipeline: Pipeline | null = null;
+  let outbox: Outbox | null = null;
   let lastPoll: { at: string; ok: boolean; message: string } | null = null;
   try {
-    pipeline = makePipeline(cfg, store);
+    ({ pipeline, outbox } = makePipeline(cfg, store));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log(`Gmail checks are off: ${message}. The dashboard still runs.`);
     lastPoll = { at: new Date().toISOString(), ok: false, message };
   }
 
-  const server = createServer({ cfg, store, pipeline, vault: vaultWriter(cfg), lastPoll: () => lastPoll });
+  if (outbox) {
+    await outbox.recover().catch((err) => log("could not check sends left from the last run", err));
+    log(cfg.sending.enabled ? `sending is on, ${cfg.sending.undoSeconds} seconds to undo` : "sending is off (sending.enabled in config.json)");
+  } else if (pipeline) log("sending needs the gmail.modify sign-in: run npm run auth");
+  const server = createServer({ cfg, store, pipeline, vault: vaultWriter(cfg), lastPoll: () => lastPoll, outbox });
   await new Promise<void>((resolve) => server.listen(cfg.dashboard.port, cfg.dashboard.host, resolve));
   log(`dashboard on http://${cfg.dashboard.host}:${cfg.dashboard.port}`);
 
@@ -128,13 +153,28 @@ async function runService(): Promise<number> {
   };
   void tick();
 
+  // Sends: due ones every second, unknown outcomes and follow-ups every half minute; never two passes at once.
+  let sending: Promise<unknown> = Promise.resolve();
+  let sendBusy = false;
+  let lastMaintain = 0;
+  const sendTimer = setInterval(() => {
+    if (!outbox || stopping || sendBusy) return;
+    sendBusy = true;
+    const maintain = Date.now() - lastMaintain > 30_000;
+    if (maintain) lastMaintain = Date.now();
+    sending = (maintain ? outbox.maintain().then(() => outbox!.tick()) : outbox.tick())
+      .catch((err) => log("send check failed", err))
+      .finally(() => (sendBusy = false));
+  }, 1000);
+
   await new Promise<void>((resolve) => {
     const stop = () => {
       stopping = true;
       if (timer) clearTimeout(timer);
-      // Let a poll in progress finish its note (at most a minute), so nothing is left half-filed.
+      clearInterval(sendTimer);
+      // Let a poll or a send in progress finish (at most a minute), so nothing is left half-done.
       const grace = new Promise((r) => setTimeout(r, 60_000).unref());
-      void Promise.race([running, grace]).then(() => server.close(() => resolve()));
+      void Promise.race([Promise.all([running, sending]), grace]).then(() => server.close(() => resolve()));
     };
     process.once("SIGTERM", stop);
     process.once("SIGINT", stop);

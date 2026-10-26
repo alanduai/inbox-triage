@@ -54,5 +54,9 @@
     "host": "127.0.0.1",
     "port": 8787
   },
+  "sending": {
+    "enabled": false,
+    "undoSeconds": 5
+  },
   "dataDir": "data"
 }

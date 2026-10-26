@@ -1,5 +1,6 @@
 import { gmail, type gmail_v1 } from "@googleapis/gmail";
 import type { OAuth2Client } from "google-auth-library";
+import { KIND_HEADER } from "./mime.js";
 import { completeBody, decodeBase64Url, parseAddressList, parseMessage, type AttachmentRef, type ParsedMessage } from "./parse.js";
 
 export interface ThreadMeta {
@@ -8,9 +9,11 @@ export interface ThreadMeta {
   labelIds: string[];
   fromEmail: string;
   recipients: string[];
+  // "ack" for an acknowledgement sent from the dashboard: a holding reply, so it closes nothing.
+  kind: string;
 }
 
-/** The few Gmail calls phase 1 needs. Read-only. */
+/** The Gmail calls for reading. Sending is in GmailSender. */
 export class GmailReader {
   private readonly api: gmail_v1.Gmail;
 
@@ -62,7 +65,7 @@ export class GmailReader {
 
   /** Light view of a thread: who wrote each message, to whom and when, without bodies. */
   async threadMeta(id: string): Promise<ThreadMeta[]> {
-    const res = await this.api.users.threads.get({ userId: "me", id, format: "metadata", metadataHeaders: ["From", "To", "Cc"] });
+    const res = await this.api.users.threads.get({ userId: "me", id, format: "metadata", metadataHeaders: ["From", "To", "Cc", KIND_HEADER] });
     return (res.data.messages ?? []).map((m) => {
       const h = (name: string) =>
         (m.payload?.headers ?? []).filter((x) => x.name?.toLowerCase() === name).map((x) => x.value ?? "").join(", ");
@@ -72,6 +75,7 @@ export class GmailReader {
         labelIds: m.labelIds ?? [],
         fromEmail: parseAddressList(h("from"))[0]?.email ?? "",
         recipients: [...parseAddressList(h("to")), ...parseAddressList(h("cc"))].map((a) => a.email),
+        kind: h(KIND_HEADER.toLowerCase()).trim(),
       };
     });
   }

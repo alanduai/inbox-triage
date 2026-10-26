@@ -90,6 +90,17 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
 .projects { margin-top: 24px; padding: 16px 20px; }
 .toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: 0 6px 24px rgba(0,0,0,.18); padding: 8px 14px; font-size: 13px; max-width: min(40rem, calc(100% - 32px)); }
 .toast[hidden] { display: none; }
+.rlabel { display: grid; grid-template-columns: 2.5rem minmax(0, 1fr); gap: 6px; align-items: center; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+input.rcpt { width: 100%; font-size: 13px; padding: 4px 8px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg); }
+.btn.danger { background: var(--bad); border-color: var(--bad); color: #fff; font-weight: 600; }
+.undo { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); display: flex; gap: 14px; align-items: center; background: var(--fg); color: var(--bg); border-radius: var(--radius); box-shadow: 0 6px 24px rgba(0,0,0,.25); padding: 8px 10px 8px 16px; font-size: 14px; z-index: 10; max-width: calc(100% - 32px); }
+.undo[hidden] { display: none; }
+.undo button { background: var(--bg); color: var(--fg); border: 0; border-radius: var(--radius); padding: 4px 14px; font: inherit; font-weight: 600; cursor: pointer; }
+dialog.confirm { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); color: var(--fg); width: min(34rem, calc(100% - 32px)); padding: 18px 20px; }
+dialog.confirm::backdrop { background: rgba(0,0,0,.4); }
+dialog.confirm h2 { font-size: 17px; margin: 0 0 8px; }
+dialog.confirm ul { padding-left: 18px; margin: 8px 0; }
+dialog.confirm p { margin: 4px 0; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -97,7 +108,7 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
   <header>
     <h1>Private inbox triage</h1>
     <p class="take" id="take">Loading…</p>
-    <p class="banner">Phase 1: reading, triage and filing only. Nothing is sent from here; copy a reply and send it from Gmail.</p>
+    <p class="banner" id="banner">Loading…</p>
   </header>
 
   <div class="kpis">
@@ -131,6 +142,12 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
   </section>
 </div>
 <div class="toast" id="toast" role="status" hidden></div>
+<div class="undo" id="undo" role="status" hidden><span id="undo-text"></span><button type="button" id="undo-btn">Undo</button></div>
+<dialog class="confirm" id="confirm" aria-labelledby="confirm-title">
+  <h2 id="confirm-title">Check before it goes</h2>
+  <div id="confirm-body"></div>
+  <div class="row"><button type="button" class="btn" id="confirm-cancel">Cancel</button><button type="button" class="btn danger" id="confirm-ok">Send</button></div>
+</dialog>
 
 <script nonce="__NONCE__">
 (function () {
@@ -144,7 +161,7 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
   function el(tag, cls, text) { var n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; }
   function api(method, path, body) {
     return fetch(path, { method: method, credentials: "same-origin", headers: body !== undefined || method !== "GET" ? { "content-type": "application/json", "x-inbox-triage": "1" } : {}, body: body !== undefined ? JSON.stringify(body) : undefined })
-      .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { if (!r.ok) throw new Error(j.error || ("HTTP " + r.status)); return j; }); });
+      .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { if (!r.ok) { var e = new Error(j.error || ("HTTP " + r.status)); e.data = j; throw e; } return j; }); });
   }
   var toastTimer;
   function toast(text) { var t = $("toast"); t.textContent = text; t.hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(function () { t.hidden = true; }, 6000); }
@@ -183,6 +200,10 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
       $("poll").textContent = (s.lastPoll ? ((s.lastPoll.ok ? "Checked Gmail " : "Gmail check failed ") + when(s.lastPoll.at) + (s.lastPoll.ok ? "" : ": " + s.lastPoll.message)) : "Gmail not checked yet")
         + (s.tz && s.tz !== Intl.DateTimeFormat().resolvedOptions().timeZone ? " · times in " + s.tz : "");
       var sel = $("project"); if (sel.options.length === 1) s.projects.forEach(function (p) { sel.appendChild(new Option(p.name, p.id)); });
+      var sd = s.sending || {};
+      $("banner").textContent = !sd.connected ? "Sending isn't connected: copy a reply and send it from Gmail, or run npm run auth on the Mac mini."
+        : !sd.enabled ? "Sending is off until you turn it on in config.json. You can save replies as Gmail drafts."
+        : "Replies sent from here can be undone for " + sd.undoSeconds + " seconds.";
       renderSetup(s.doctor);
     });
   }
@@ -216,6 +237,7 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
       if (i.senderVerified === false) meta.appendChild(el("span", "chip bad", "Unverified sender"));
       if (i.onlyCc) meta.appendChild(el("span", "chip", "cc"));
       if (i.reviewRequired) meta.appendChild(el("span", "chip warn", "Review required"));
+      if (i.ackedAt) meta.appendChild(el("span", "chip ok", "Acknowledged"));
       if (i.replyBy && i.status === "needs_reply") meta.appendChild(el("span", "muted", "Reply by " + replyBy(i.replyByUtc, i.replyBy)));
       if (i.status === "needs_action") meta.appendChild(el("span", "chip warn", STATUS[i.status]));
       else if (i.status !== "needs_reply") meta.appendChild(el("span", "chip " + (i.status === "triage_failed" ? "warn" : "ok"), STATUS[i.status] || i.status));
@@ -254,6 +276,7 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
     if (d.senderVerified === false) top.appendChild(el("span", "chip bad", "Unverified sender"));
     if (d.onlyCc) top.appendChild(el("span", "chip", "You were in cc"));
     if (d.reviewRequired) top.appendChild(el("span", "chip warn", "Review required"));
+    if (d.ackedAt) top.appendChild(el("span", "chip ok", "Acknowledged " + when(d.ackedAt)));
     top.appendChild(el("span", "chip " + (d.status === "triage_failed" || d.status === "needs_action" ? "warn" : d.status === "needs_reply" ? "" : "ok"), STATUS[d.status] || d.status));
     box.appendChild(top);
     box.appendChild(el("h2", "", d.title));
@@ -313,34 +336,46 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
     } else ob.appendChild(el("p", "assume", "Not filed to Obsidian yet. Check the service log on the Mac mini."));
     box.appendChild(ob);
 
-    if (t && t.suggested_reply) {
-      var rp = blk(d.status === "needs_reply" ? "Suggested reply" : "Suggested reply (for reference)");
-      if (t.draft_assumption) rp.appendChild(el("p", "assume", "Check: " + t.draft_assumption));
-      var ta = el("textarea"); ta.value = d.draft != null ? d.draft : t.suggested_reply; ta.setAttribute("aria-label", "Reply");
-      var state = el("span", "muted", d.draft != null && d.draft !== t.suggested_reply ? "Edited" : "");
-      ta.addEventListener("input", function () {
-        state.textContent = "Saving…"; clearTimeout(S.saveTimers[d.id]);
-        var text = ta.value;
-        S.saveTimers[d.id] = setTimeout(function () { delete S.saveTimers[d.id]; api("PUT", "/api/items/" + d.id + "/draft", { text: text }).then(function () { state.textContent = "Edited, saved"; }).catch(function (e) { state.textContent = ""; toast(e.message); }); }, 700);
-      });
-      rp.appendChild(ta);
-      var row = el("div", "row");
-      row.appendChild(btn("Copy reply", "p", function () {
-        copy(ta.value).then(function () { toast(hasBrackets(ta.value) ? "Copied. It still has [brackets]: fill them in before you send it in Gmail." : "Copied. Paste it into your reply in Gmail."); });
-      }));
-      row.appendChild(btn("Send reply", "", null, true, "Sending arrives in phase 2"));
-      row.appendChild(btn("Reset to suggestion", "", function () { ta.value = t.suggested_reply; api("PUT", "/api/items/" + d.id + "/draft", { text: null }).then(function () { state.textContent = ""; }); }));
-      row.appendChild(state);
-      rp.appendChild(row);
-      if (d.reviewRequired) rp.appendChild(el("p", "muted", "Review required: from phase 2, sending to this matter's court or other side asks you to confirm twice."));
-      box.appendChild(rp);
-    }
+    var sd = d.sending || {};
+    var latest = (d.outbox || [])[0];
+    var busy = Boolean(latest && (latest.state === "queued" || latest.state === "sending"));
+    var cantSend = !sd.connected ? "Gmail is not connected with permission to send: run npm run auth" : !sd.enabled ? "Sending is off in config.json" : busy ? "A reply is already on its way" : "";
+    var rp = blk(t && t.suggested_reply ? (OPEN[d.status] ? "Suggested reply" : "Suggested reply (for reference)") : "Reply");
+    if (t && t.draft_assumption) rp.appendChild(el("p", "assume", "Check: " + t.draft_assumption));
+    var toIn = rcptField(rp, "To", d.recipients.to), ccIn = rcptField(rp, "Cc", d.recipients.cc);
+    if (d.replyRedirected) rp.appendChild(el("p", "muted", "Only your lawyer is in To: replying to all would copy the court or the other side."));
+    var suggestion = t && t.suggested_reply ? t.suggested_reply : "";
+    var ta = el("textarea"); ta.value = d.draft != null ? d.draft : suggestion; ta.setAttribute("aria-label", "Reply");
+    var state = el("span", "muted", d.draft != null && d.draft !== suggestion ? "Edited" : "");
+    ta.addEventListener("input", function () {
+      state.textContent = "Saving…"; clearTimeout(S.saveTimers[d.id]);
+      var text = ta.value;
+      S.saveTimers[d.id] = setTimeout(function () { delete S.saveTimers[d.id]; api("PUT", "/api/items/" + d.id + "/draft", { text: text }).then(function () { state.textContent = "Edited, saved"; }).catch(function (e) { state.textContent = ""; toast(e.message); }); }, 700);
+    });
+    rp.appendChild(ta);
+    var row = el("div", "row");
+    row.appendChild(btn("Send", "p", function () { sendReq(d, { kind: "reply", to: rcptList(toIn.value), cc: rcptList(ccIn.value), text: ta.value }); }, Boolean(cantSend), cantSend));
+    row.appendChild(btn("Save as Gmail draft", "", function () {
+      api("POST", "/api/items/" + d.id + "/gmail-draft", { to: rcptList(toIn.value), cc: rcptList(ccIn.value), text: ta.value })
+        .then(function () { toast("Saved as a draft in the Gmail thread. Finish it in Gmail or Superhuman; the item closes once it is sent."); }).catch(function (e) { toast(e.message); });
+    }, !sd.connected, sd.connected ? "" : "Gmail is not connected with permission to save drafts"));
+    row.appendChild(btn("Copy reply", "", function () {
+      copy(ta.value).then(function () { toast(hasBrackets(ta.value) ? "Copied. It still has [brackets]: fill them in before you send it." : "Copied."); });
+    }));
+    if (suggestion) row.appendChild(btn("Reset to suggestion", "", function () { ta.value = suggestion; api("PUT", "/api/items/" + d.id + "/draft", { text: null }).then(function () { state.textContent = ""; }); }));
+    row.appendChild(state);
+    rp.appendChild(row);
+    if (d.reviewRequired) rp.appendChild(el("p", "muted", "Review required: Send asks you to confirm a second time, with every recipient listed."));
+    outboxLine(rp, latest, d);
+    box.appendChild(rp);
 
     if (t && t.ack_reply) {
       var ak = blk("Or acknowledge now, reply later");
       ak.appendChild(el("p", "ack", t.ack_reply));
       var ar = el("div", "row"); ar.appendChild(btn("Copy acknowledgement", "", function () { copy(t.ack_reply).then(function () { toast("Copied."); }); }));
-      ar.appendChild(btn("Send acknowledgement", "", null, true, "Sending arrives in phase 2")); ak.appendChild(ar);
+      ar.appendChild(btn("Send acknowledgement", "", function () { sendReq(d, { kind: "ack", to: rcptList(toIn.value), cc: rcptList(ccIn.value) }); }, Boolean(cantSend), cantSend));
+      ak.appendChild(ar);
+      ak.appendChild(el("p", "muted", "Goes to the recipients above. The message stays in your queue until the real reply goes out."));
       box.appendChild(ak);
     }
 
@@ -350,6 +385,70 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
     else act.appendChild(btn("Back to the queue", "", function () { setStatus(d.id, "needs_reply"); }));
     act.appendChild(el("span", "muted", "Replies you send from Gmail or Superhuman close the item on the next check."));
     box.appendChild(act);
+  }
+
+  function rcptField(box, label, list) {
+    var l = el("label", "rlabel"); l.appendChild(el("span", "", label));
+    var i = el("input", "rcpt"); i.type = "text"; i.value = list.join(", "); i.autocomplete = "off"; i.spellcheck = false;
+    l.appendChild(i); box.appendChild(l); return i;
+  }
+  function rcptList(v) { return v.split(/[,;\s]+/).map(function (x) { return x.trim(); }).filter(Boolean); }
+  function outboxLine(box, e, d) {
+    if (!e || e.state === "cancelled") return;
+    var r = el("div", "row");
+    if (e.state === "queued" || e.state === "sending") r.appendChild(el("span", "chip warn", "Sending…"));
+    else if (e.state === "sent") r.appendChild(el("span", "chip ok", (e.kind === "ack" ? "Acknowledgement sent " : "Sent ") + when(e.sentAt)));
+    else { r.appendChild(el("span", "chip bad", "Not sent")); r.appendChild(el("span", "muted", e.error)); r.appendChild(btn("Retry", "", function () { retrySend(e.id, d.id); })); }
+    box.appendChild(r);
+  }
+  function sendReq(d, req) {
+    api("POST", "/api/items/" + d.id + "/send", req).then(function (e) { startUndo(e, d.id); }).catch(function (err) {
+      if (err.data && err.data.needsConfirm) { askConfirm(d, req, err.data); return; }
+      toast(err.message);
+    });
+  }
+  // The second confirmation: why, and every recipient, before anything is queued.
+  function askConfirm(d, req, c) {
+    var dlg = $("confirm"), body = $("confirm-body"); body.replaceChildren(); $("toast").hidden = true;
+    var ul = el("ul"); c.reasons.forEach(function (r) { ul.appendChild(el("li", "", r)); }); body.appendChild(ul);
+    body.appendChild(el("p", "", "To: " + c.to.join(", ")));
+    if (c.cc.length) body.appendChild(el("p", "", "Cc: " + c.cc.join(", ")));
+    var n = c.to.length + c.cc.length;
+    $("confirm-ok").textContent = (req.kind === "ack" ? "Send acknowledgement to " : "Send to ") + n + (n === 1 ? " recipient" : " recipients");
+    $("confirm-ok").onclick = function () { dlg.close(); var again = Object.assign({}, req, { confirm: c.token }); sendReq(d, again); };
+    $("confirm-cancel").onclick = function () { dlg.close(); toast("Not sent."); };
+    dlg.showModal();
+  }
+  // Undo: the countdown follows the server's window, measured from when the server queued it.
+  var U = { id: null, item: null, until: 0, timer: null };
+  function startUndo(e, itemId) {
+    U.id = e.id; U.item = itemId; U.until = Date.now() + Math.max(0, new Date(e.sendAt).getTime() - new Date(e.createdAt).getTime());
+    $("undo").hidden = false; tickUndo();
+    if (S.sel === itemId) loadDetail(itemId);
+  }
+  function tickUndo() {
+    clearTimeout(U.timer);
+    var left = Math.ceil((U.until - Date.now()) / 1000);
+    if (left > 0) { $("undo-text").textContent = "Sending in " + left + " s"; U.timer = setTimeout(tickUndo, 250); return; }
+    $("undo").hidden = true; var id = U.id, item = U.item; U.id = null; if (id) watchSend(id, item, 0);
+  }
+  $("undo-btn").addEventListener("click", function () {
+    if (!U.id) return;
+    var id = U.id, item = U.item; clearTimeout(U.timer); $("undo").hidden = true; U.id = null;
+    api("POST", "/api/outbox/" + id + "/undo").then(function () { toast("Undone. Nothing was sent."); if (S.sel === item) loadDetail(item); })
+      .catch(function (e) { toast(e.message); watchSend(id, item, 0); });
+  });
+  function watchSend(id, itemId, n) {
+    api("GET", "/api/outbox/" + id).then(function (e) {
+      if ((e.state === "queued" || e.state === "sending") && n < 40) { setTimeout(function () { watchSend(id, itemId, n + 1); }, 750); return; }
+      toast(e.state === "sent" ? (e.kind === "ack" ? "Acknowledgement sent. The message stays in your queue for the real reply." : "Sent. The thread is marked read and archived in Gmail.")
+        : e.state === "failed" ? "Not sent: " + e.error : "Still sending. Check again in a moment.");
+      refresh(); if (S.sel === itemId) loadDetail(itemId);
+    }).catch(function (err) { toast(err.message); });
+  }
+  function retrySend(id, itemId) {
+    api("POST", "/api/outbox/" + id + "/retry").then(function (e) { if (e.state === "sent") { toast("It had gone out after all. Marked as sent."); refresh(); loadDetail(itemId); } else startUndo(e, itemId); })
+      .catch(function (err) { toast(err.message); });
   }
 
   function setStatus(id, status) {

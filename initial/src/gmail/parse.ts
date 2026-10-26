@@ -28,6 +28,8 @@ export interface ParsedMessage {
   replyTo: Address[];
   subject: string;
   rfc822MessageId: string;
+  // The original References header, carried into replies so every client keeps the thread together.
+  references: string;
   // Full text of the message, and the text without quoted earlier messages.
   text: string;
   latestText: string;
@@ -389,6 +391,7 @@ export function parseMessage(msg: gmail_v1.Schema$Message): ParsedMessage {
     replyTo: parseAddressList(header(headers, "Reply-To", true)),
     subject: header(headers, "Subject") || "(no subject)",
     rfc822MessageId: header(headers, "Message-ID"),
+    references: header(headers, "References", true).replace(/\s+/g, " ").trim(),
     text,
     latestText: stripQuoted(text, header(headers, "Subject")),
     attachments,

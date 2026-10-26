@@ -4,6 +4,9 @@ import type { LoadedConfig } from "./config.js";
 import {
   attachmentLine,
   blockId,
+  insertSection,
+  sentBlockId,
+  sentSection,
   replaceAttachmentLine,
   replaceByHandTask,
   replaceTriageFailed,
@@ -13,9 +16,9 @@ import {
 } from "./obsidian/note.js";
 import type { VaultWriter } from "./obsidian/writer.js";
 import { matchContact, needsReview } from "./scope.js";
-import { OPEN_STATUSES, type Item, type Status, type Store } from "./store/db.js";
+import { OPEN_STATUSES, type Item, type OutboxEntry, type Status, type Store } from "./store/db.js";
 import { URGENCIES, type Urgency } from "./triage/schema.js";
-import { localIso, log } from "./util/time.js";
+import { localIso, localStamp, log } from "./util/time.js";
 
 // Renamed or moved notes are looked for in at most this many Markdown files.
 const MAX_NOTES_SCANNED = 5_000;
@@ -143,6 +146,26 @@ export class ThreadNotes {
       } catch {
         // the store is unavailable too; the flags set with the change itself still stand
       }
+      return false;
+    }
+  }
+
+  /**
+   * Adds what you sent from the dashboard to the thread's note, in date order. Safe to repeat: a
+   * reply already in the note is not added again. False when the note could not be written yet.
+   */
+  recordSent(item: Item, sent: OutboxEntry): boolean {
+    try {
+      const notePath = this.noteFor(item.threadId, item.projectId);
+      if (!notePath) return true;
+      const content = this.vault.read(notePath);
+      if (new RegExp(`\\^${sentBlockId(sent.id)}[ \\t]*$`, "m").test(content)) return true;
+      const stamp = localStamp(new Date(sent.sentAt ?? Date.now()), this.cfg.tz);
+      const section = sentSection({ outboxId: sent.id, sentLocal: stamp, kind: sent.kind, to: sent.to, cc: sent.cc, body: sent.body });
+      this.vault.write(notePath, insertSection(content, section, stamp));
+      return true;
+    } catch (err) {
+      log(`could not add the sent reply ${sent.id} to the note; it is tried again`, err);
       return false;
     }
   }

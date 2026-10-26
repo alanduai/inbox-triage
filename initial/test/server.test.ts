@@ -52,8 +52,13 @@ test("a network-reachable dashboard needs the token, then works with a cookie", 
     const nonce = csp.match(/'nonce-([^']+)'/)![1]!;
     assert.match(await page.text(), new RegExp(`<script nonce="${nonce.replace(/[+/=]/g, (c) => "\\" + c)}">`));
 
-    const send = await fetch(`${base}/api/items/abc/send`, { method: "POST", headers: { cookie, "x-inbox-triage": "1" } });
-    assert.equal(send.status, 501, "phase 1 never sends");
+    // Without a Gmail sign-in that allows sending, nothing can be sent.
+    const send = await fetch(`${base}/api/items/abc/send`, {
+      method: "POST",
+      headers: { cookie, "x-inbox-triage": "1" },
+      body: JSON.stringify({ kind: "reply", to: ["marija@bank.example"], cc: [], text: "Hvala." }),
+    });
+    assert.equal(send.status, 503);
   } finally {
     server.close();
   }
@@ -76,7 +81,7 @@ test("a this-Mac-only dashboard refuses other host names", async () => {
     assert.equal(status.status, 200);
     const summary = (await (await fetch(`${base}/api/summary`)).json()) as { needsReply: number; phase: number };
     assert.equal(summary.needsReply, 0);
-    assert.equal(summary.phase, 1);
+    assert.equal(summary.phase, 2);
 
     // Back to the queue records when, so earlier replies no longer close it.
     const back = await fetch(`${base}/api/items/abc/status`, { method: "POST", headers: { "x-inbox-triage": "1", "content-type": "application/json" }, body: JSON.stringify({ status: "needs_reply" }) });

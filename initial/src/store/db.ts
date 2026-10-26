@@ -60,6 +60,8 @@ export interface Item {
   userUrgency: Urgency | null;
   // Set when you put a closed item back in the queue; replies sent before it no longer close it.
   reopenedAt: string | null;
+  // When an acknowledgement went out from the dashboard; the item stays open for the real reply.
+  ackedAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -117,6 +119,24 @@ CREATE TABLE IF NOT EXISTS thread_notes (
   PRIMARY KEY (thread_id, project_id)
 );
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS outbox (
+  id TEXT PRIMARY KEY,
+  item_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  to_json TEXT NOT NULL,
+  cc_json TEXT NOT NULL,
+  body TEXT NOT NULL,
+  state TEXT NOT NULL,
+  send_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  attempt_at TEXT,
+  gmail_id TEXT,
+  sent_at TEXT,
+  error TEXT NOT NULL DEFAULT '',
+  effects INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS outbox_state ON outbox(state);
+CREATE INDEX IF NOT EXISTS outbox_item ON outbox(item_id);
 CREATE TABLE IF NOT EXISTS skipped (id TEXT PRIMARY KEY, reason TEXT NOT NULL, at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,8 +177,57 @@ function toItem(r: Row): Item {
     userUrgency: r.user_urgency == null ? null : (String(r.user_urgency) as Urgency),
     senderVerified: r.sender_verified == null ? null : Number(r.sender_verified) === 1,
     reopenedAt: r.reopened_at == null ? null : String(r.reopened_at),
+    ackedAt: r.acked_at == null ? null : String(r.acked_at),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
+  };
+}
+
+// queued: waiting out the Undo window. sending: handed to Gmail, outcome not yet recorded.
+// sent, failed (shown with Retry) and cancelled (undone) are final until you press Retry.
+export const OUTBOX_STATES = ["queued", "sending", "sent", "failed", "cancelled"] as const;
+export type OutboxState = (typeof OUTBOX_STATES)[number];
+
+// What has happened after a send: the item's status, the note in Obsidian, the archive in Gmail.
+export const EFFECT_STATUS = 1;
+export const EFFECT_NOTE = 2;
+export const EFFECT_ARCHIVE = 4;
+export const EFFECTS_ALL = EFFECT_STATUS | EFFECT_NOTE | EFFECT_ARCHIVE;
+
+export interface OutboxEntry {
+  id: string;
+  itemId: string;
+  kind: "reply" | "ack";
+  to: string[];
+  cc: string[];
+  // Your text, without the quoted original.
+  body: string;
+  state: OutboxState;
+  sendAt: string;
+  createdAt: string;
+  attemptAt: string | null;
+  gmailId: string | null;
+  sentAt: string | null;
+  error: string;
+  effects: number;
+}
+
+function toOutbox(r: Row): OutboxEntry {
+  return {
+    id: String(r.id),
+    itemId: String(r.item_id),
+    kind: String(r.kind) as "reply" | "ack",
+    to: JSON.parse(String(r.to_json)) as string[],
+    cc: JSON.parse(String(r.cc_json)) as string[],
+    body: String(r.body),
+    state: String(r.state) as OutboxState,
+    sendAt: String(r.send_at),
+    createdAt: String(r.created_at),
+    attemptAt: r.attempt_at == null ? null : String(r.attempt_at),
+    gmailId: r.gmail_id == null ? null : String(r.gmail_id),
+    sentAt: r.sent_at == null ? null : String(r.sent_at),
+    error: String(r.error ?? ""),
+    effects: Number(r.effects ?? 0),
   };
 }
 
@@ -178,6 +247,7 @@ export class Store {
     // Whether the note is behind: 0 no, 1 its details (frontmatter, triage and attachment lines),
     // 2 its checkbox too (the status changed). Set with the change, cleared once the note is written.
     if (!cols.has("note_stale")) this.db.exec("ALTER TABLE items ADD COLUMN note_stale INTEGER NOT NULL DEFAULT 0");
+    if (!cols.has("acked_at")) this.db.exec("ALTER TABLE items ADD COLUMN acked_at TEXT");
     if (!cols.has("file_attempts")) this.db.exec("ALTER TABLE items ADD COLUMN file_attempts INTEGER NOT NULL DEFAULT 0");
     // Thread notes are now kept per matter; carry over the first release's table.
     this.db.exec("INSERT OR IGNORE INTO thread_notes (thread_id, project_id, note_path, created_at) SELECT thread_id, project_id, note_path, created_at FROM threads");
@@ -407,6 +477,107 @@ export class Store {
 
   log(itemId: string | null, kind: string, detail: string): void {
     this.db.prepare("INSERT INTO events (item_id, at, kind, detail) VALUES (?, ?, ?, ?)").run(itemId, new Date().toISOString(), kind, detail);
+  }
+
+
+  // ---------- outbox ----------
+
+  /** Adds a send in the Undo window, unless one for the same message is already queued or going out. */
+  outboxAdd(e: Pick<OutboxEntry, "id" | "itemId" | "kind" | "to" | "cc" | "body" | "sendAt">): boolean {
+    const now = new Date().toISOString();
+    const r = this.db
+      .prepare(
+        `INSERT INTO outbox (id, item_id, kind, to_json, cc_json, body, state, send_at, created_at)
+         SELECT ?, ?, ?, ?, ?, ?, 'queued', ?, ? WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE item_id = ? AND state IN ('queued', 'sending'))`,
+      )
+      .run(e.id, e.itemId, e.kind, JSON.stringify(e.to), JSON.stringify(e.cc), e.body, e.sendAt, now, e.itemId);
+    if (Number(r.changes)) this.log(e.itemId, "send_queued", `${e.kind} ${e.id} to ${[...e.to, ...e.cc].join(", ")}`);
+    return Number(r.changes) === 1;
+  }
+
+  outboxGet(id: string): OutboxEntry | null {
+    const row = this.db.prepare("SELECT * FROM outbox WHERE id = ?").get(id) as Row | undefined;
+    return row ? toOutbox(row) : null;
+  }
+
+  outboxForItem(itemId: string, limit = 5): OutboxEntry[] {
+    return (this.db.prepare("SELECT * FROM outbox WHERE item_id = ? ORDER BY created_at DESC LIMIT ?").all(itemId, limit) as Row[]).map(toOutbox);
+  }
+
+  outboxInState(state: OutboxState): OutboxEntry[] {
+    return (this.db.prepare("SELECT * FROM outbox WHERE state = ? ORDER BY send_at").all(state) as Row[]).map(toOutbox);
+  }
+
+  /** Queued sends whose Undo window has passed. */
+  outboxDue(nowIso: string): OutboxEntry[] {
+    return (this.db.prepare("SELECT * FROM outbox WHERE state = 'queued' AND send_at <= ? ORDER BY send_at").all(nowIso) as Row[]).map(toOutbox);
+  }
+
+  /** Takes a queued send for delivery. False when it was undone or another worker took it. */
+  outboxClaim(id: string): boolean {
+    const r = this.db.prepare("UPDATE outbox SET state = 'sending', attempt_at = ? WHERE id = ? AND state = 'queued'").run(new Date().toISOString(), id);
+    return Number(r.changes) === 1;
+  }
+
+  /** Undo: only while it is still in the Undo window. */
+  outboxCancel(id: string): boolean {
+    const r = this.db.prepare("UPDATE outbox SET state = 'cancelled' WHERE id = ? AND state = 'queued'").run(id);
+    const e = this.outboxGet(id);
+    if (Number(r.changes) && e) this.log(e.itemId, "send_undone", id);
+    return Number(r.changes) === 1;
+  }
+
+  outboxSent(id: string, gmailId: string): void {
+    const r = this.db.prepare("UPDATE outbox SET state = 'sent', gmail_id = ?, sent_at = ?, error = '' WHERE id = ? AND state IN ('sending', 'failed')").run(gmailId, new Date().toISOString(), id);
+    const e = this.outboxGet(id);
+    if (Number(r.changes) && e) this.log(e.itemId, "sent", `${e.kind} ${id} as ${gmailId}`);
+  }
+
+  outboxFailed(id: string, error: string): void {
+    const r = this.db.prepare("UPDATE outbox SET state = 'failed', error = ? WHERE id = ? AND state IN ('sending', 'queued')").run(error, id);
+    const e = this.outboxGet(id);
+    if (Number(r.changes) && e) this.log(e.itemId, "send_failed", `${id}: ${error}`);
+  }
+
+  /** Notes an error on a send whose outcome is still unknown; it stays "sending" until checked. */
+  outboxNote(id: string, error: string): void {
+    this.db.prepare("UPDATE outbox SET error = ? WHERE id = ?").run(error, id);
+  }
+
+  /** Retry: a failed send goes back into the Undo window. */
+  outboxRequeue(id: string, sendAt: string): boolean {
+    const e = this.outboxGet(id);
+    if (!e) return false;
+    const r = this.db
+      .prepare(
+        `UPDATE outbox SET state = 'queued', send_at = ?, error = '' WHERE id = ? AND state = 'failed'
+         AND NOT EXISTS (SELECT 1 FROM outbox WHERE item_id = ? AND id != ? AND state IN ('queued', 'sending'))`,
+      )
+      .run(sendAt, id, e.itemId, id);
+    return Number(r.changes) === 1;
+  }
+
+  addEffects(id: string, bits: number): void {
+    this.db.prepare("UPDATE outbox SET effects = (effects | ?) WHERE id = ?").run(bits, id);
+  }
+
+  /** Sent messages whose follow-up (status, note, archive) is not finished. */
+  outboxUnfinished(): OutboxEntry[] {
+    return (this.db.prepare("SELECT * FROM outbox WHERE state = 'sent' AND effects != ? ORDER BY sent_at").all(EFFECTS_ALL) as Row[]).map(toOutbox);
+  }
+
+  /** Gmail ids of acknowledgements sent in a thread: holding replies, so they close nothing. */
+  ackGmailIds(threadId: string): string[] {
+    return (
+      this.db
+        .prepare("SELECT o.gmail_id FROM outbox o JOIN items i ON i.id = o.item_id WHERE i.thread_id = ? AND o.kind = 'ack' AND o.gmail_id IS NOT NULL")
+        .all(threadId) as Row[]
+    ).map((r) => String(r.gmail_id));
+  }
+
+  setAcked(id: string, at: string): void {
+    this.db.prepare("UPDATE items SET acked_at = ?, note_stale = max(note_stale, 1), updated_at = ? WHERE id = ?").run(at, new Date().toISOString(), id);
+    this.log(id, "acknowledged", at);
   }
 
   /**

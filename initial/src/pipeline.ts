@@ -431,7 +431,9 @@ export class Pipeline {
         log(`could not check thread ${threadId}`, err);
         continue;
       }
-      const sent = meta.filter((m) => isSentReply(m.labelIds));
+      // An acknowledgement from the dashboard is a holding reply: it closes nothing.
+      const acks = new Set(this.store.ackGmailIds(threadId));
+      const sent = meta.filter((m) => isSentReply(m.labelIds) && m.kind !== "ack" && !acks.has(m.id));
       for (const item of this.store.openInThread(threadId)) {
         // A reply closes what asked for a reply; a task without a reply (needs_action) waits for you.
         if (item.status === "pending_triage" || item.status === "needs_action") continue;
