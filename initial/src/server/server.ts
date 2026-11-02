@@ -10,6 +10,9 @@ import type { VaultWriter } from "../obsidian/writer.js";
 import { log } from "../util/time.js";
 import { quotedRest } from "../gmail/parse.js";
 import { dashboardHtml } from "./ui.js";
+import { expensesHtml } from "./expenses-ui.js";
+import { Busy, NotFound, setupChecks, type ExpenseService } from "../expenses/service.js";
+import type { ExpenseRun } from "../expenses/types.js";
 
 const COOKIE = "it_token";
 
@@ -22,6 +25,36 @@ export interface ServerDeps {
   pipeline: Pipeline | null;
   vault: VaultWriter;
   lastPoll: () => { at: string; ok: boolean; message: string } | null;
+  // The monthly expenses agent; null when config.json has no "expenses" section.
+  expenses?: ExpenseService | null;
+}
+
+function runSummary(r: ExpenseRun) {
+  const attached = new Set(r.draft?.attached ?? []);
+  const inDraft = r.lines.filter((l) => l.files.some((f) => attached.has(f.filename))).length;
+  const review = r.lines.filter((l) => !l.files.some((f) => attached.has(f.filename)) && (l.status === "needs_review" || ((l.status === "found_gmail" || l.status === "found_portal") && !l.include))).length;
+  return {
+    id: r.id,
+    startedAt: r.startedAt,
+    finishedAt: r.finishedAt,
+    status: r.status,
+    period: r.period,
+    total: r.lines.length,
+    attached: inDraft,
+    review,
+    missing: r.lines.length - inDraft - review,
+    summary: r.summary,
+  };
+}
+
+/** The run as the page sees it: only Gmail links are passed on. */
+function runForPage(r: ExpenseRun): ExpenseRun {
+  const gmail = (u: string) => (u.startsWith("https://mail.google.com/") ? u : "");
+  return {
+    ...r,
+    request: r.request ? { ...r.request, link: gmail(r.request.link) } : null,
+    lines: r.lines.map((l) => ({ ...l, source: l.source?.kind === "gmail" ? { ...l.source, link: gmail(l.source.link) } : l.source })),
+  };
 }
 
 function summaryOf(item: Item, projectName: string) {
@@ -148,8 +181,23 @@ export function createServer(deps: ServerDeps): http.Server {
         return res.end(dashboardHtml(nonce));
       }
 
+      if (req.method === "GET" && url.pathname === "/expenses") {
+        const nonce = randomBytes(16).toString("base64");
+        res.writeHead(200, {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+          "referrer-policy": "no-referrer",
+          "x-frame-options": "DENY",
+          "content-security-policy": `default-src 'self'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
+        });
+        return res.end(expensesHtml(nonce));
+      }
+
       const parts = url.pathname.split("/").filter(Boolean);
       if (parts[0] !== "api") return send(res, 404, "Not found");
+
+      if (parts[1] === "expenses") return await expensesApi(req, res, parts.slice(2), deps);
 
       if (req.method === "GET" && parts[1] === "items" && parts.length === 2) {
         const view = (url.searchParams.get("view") ?? "open") as "open" | "done" | "all";
@@ -184,6 +232,7 @@ export function createServer(deps: ServerDeps): http.Server {
           doctor,
           projects: cfg.projects.map((p) => ({ id: p.id, name: p.name, folder: p.folder })),
           phase: 1,
+          expenses: Boolean(deps.expenses?.enabled),
         });
       }
 
@@ -262,4 +311,51 @@ export function createServer(deps: ServerDeps): http.Server {
       if (!res.headersSent) send(res, 500, { error: "internal error" });
     }
   });
+}
+
+async function expensesApi(req: http.IncomingMessage, res: http.ServerResponse, parts: string[], deps: ServerDeps): Promise<void> {
+  const { cfg } = deps;
+  const svc = deps.expenses ?? null;
+  const x = cfg.expenses;
+  if (req.method === "GET" && parts[0] === "state" && parts.length === 1) {
+    const account = x?.gmail.account ?? cfg.gmail.account;
+    return send(res, 200, {
+      enabled: Boolean(svc?.enabled),
+      company: x?.company ?? "",
+      accountant: x?.accountant.name ?? "",
+      tz: cfg.tz,
+      checks: setupChecks(cfg),
+      runningId: svc?.runningId() ?? null,
+      runs: svc ? svc.runs.list(24).map(runSummary) : [],
+      draftsLink: `https://mail.google.com/mail/?authuser=${encodeURIComponent(account)}#drafts`,
+    });
+  }
+  if (!svc) return send(res, 503, { error: 'The expenses agent is not set up: add the "expenses" section to config.json.' });
+  if (req.method === "POST" && parts[0] === "run" && parts.length === 1) {
+    const started = svc.start("dashboard");
+    if (!started.ok) return send(res, started.status, { error: started.error });
+    started.done.catch(() => undefined);
+    return send(res, 202, { runId: started.runId });
+  }
+  if (parts[0] === "runs" && parts[1]) {
+    const run = svc.runs.get(parts[1]);
+    if (!run) return send(res, 404, { error: "not found" });
+    try {
+      if (req.method === "GET" && parts.length === 2) return send(res, 200, runForPage(run));
+      if (req.method === "POST" && parts[2] === "lines" && parts[3] && parts.length === 4) {
+        const body = await readJson(req);
+        if (typeof body.include !== "boolean") return send(res, 400, { error: "include must be true or false" });
+        const n = Number(parts[3]);
+        if (!Number.isInteger(n)) return send(res, 400, { error: "bad line" });
+        return send(res, 200, runForPage(svc.setInclude(run.id, n, body.include)));
+      }
+      if (req.method === "POST" && parts[2] === "redraft" && parts.length === 3) return send(res, 200, runForPage(await svc.redraft(run.id)));
+    } catch (err) {
+      if (err instanceof Busy) return send(res, 409, { error: err.message });
+      if (err instanceof NotFound) return send(res, 404, { error: err.message });
+      log("expenses request failed", err);
+      return send(res, 500, { error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  return send(res, 404, { error: "not found" });
 }

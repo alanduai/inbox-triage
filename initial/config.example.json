@@ -1,7 +1,9 @@
 {
   "owner": {
     "name": "Alan",
-    "emails": ["you@example.com"]
+    "emails": [
+      "you@example.com"
+    ]
   },
   "vault": {
     "path": "/Users/you/Documents/Obsidian/B",
@@ -29,13 +31,36 @@
       "id": "sweden-legal",
       "name": "Sweden — legal matter",
       "folder": "Projects/Sweden legal matter",
-      "counsel": { "name": "Your lawyer", "email": "lawyer@your-law-firm.example", "language": "en" },
+      "counsel": {
+        "name": "Your lawyer",
+        "email": "lawyer@your-law-firm.example",
+        "language": "en"
+      },
       "contacts": [
-        { "match": "lawyer@your-law-firm.example", "role": "own_lawyer", "alwaysUrgent": true },
-        { "match": "@your-law-firm.example", "role": "own_lawyer" },
-        { "match": "@partner-firm.example", "role": "own_lawyer" },
-        { "match": "@court.example", "role": "court", "reviewRequired": true, "alwaysUrgent": true },
-        { "match": "@other-side-firm.example", "role": "opposing_counsel", "reviewRequired": true }
+        {
+          "match": "lawyer@your-law-firm.example",
+          "role": "own_lawyer",
+          "alwaysUrgent": true
+        },
+        {
+          "match": "@your-law-firm.example",
+          "role": "own_lawyer"
+        },
+        {
+          "match": "@partner-firm.example",
+          "role": "own_lawyer"
+        },
+        {
+          "match": "@court.example",
+          "role": "court",
+          "reviewRequired": true,
+          "alwaysUrgent": true
+        },
+        {
+          "match": "@other-side-firm.example",
+          "role": "opposing_counsel",
+          "reviewRequired": true
+        }
       ]
     },
     {
@@ -43,10 +68,23 @@
       "name": "Croatia — bank & advisors",
       "folder": "Projects/Croatia bank and advisors",
       "contacts": [
-        { "match": "contact@bank.example", "role": "bank", "alwaysUrgent": true },
-        { "match": "@bank.example", "role": "bank" },
-        { "match": "@advisor-one.example", "role": "advisor" },
-        { "match": "@advisor-two.example", "role": "advisor" }
+        {
+          "match": "contact@bank.example",
+          "role": "bank",
+          "alwaysUrgent": true
+        },
+        {
+          "match": "@bank.example",
+          "role": "bank"
+        },
+        {
+          "match": "@advisor-one.example",
+          "role": "advisor"
+        },
+        {
+          "match": "@advisor-two.example",
+          "role": "advisor"
+        }
       ]
     }
   ],
@@ -54,5 +92,27 @@
     "host": "127.0.0.1",
     "port": 8787
   },
-  "dataDir": "data"
+  "dataDir": "data",
+  "expenses": {
+    "company": "Bea Nekretnine d.o.o.",
+    "accountant": {
+      "name": "Ivana Nikolić",
+      "emails": [
+        "ivana@her-accounting-firm.example"
+      ],
+      "greeting": "Pozdrav Ivana,"
+    },
+    "gmail": {
+      "account": "you@example.com"
+    },
+    "receiptsDir": "/Users/you/Documents/Bea Nekretnine/Računi",
+    "monthFolder": "{YYYY}/{MM} {Month}",
+    "browser": {
+      "enabled": true,
+      "headless": true
+    },
+    "notify": {
+      "macos": true
+    }
+  }
 }

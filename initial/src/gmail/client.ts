@@ -12,7 +12,7 @@ export interface ThreadMeta {
 
 /** The few Gmail calls phase 1 needs. Read-only. */
 export class GmailReader {
-  private readonly api: gmail_v1.Gmail;
+  protected readonly api: gmail_v1.Gmail;
 
   constructor(auth: OAuth2Client) {
     this.api = gmail({ version: "v1", auth });
