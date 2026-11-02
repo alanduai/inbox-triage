@@ -84,13 +84,15 @@ function scripted(steps: Step[]) {
   return { create, seen, calls };
 }
 
+/** Locally a missing Chromium skips these tests; in CI it fails them, so they never pass by not running. */
 async function launchable(): Promise<boolean> {
   try {
     const { chromium } = await import("playwright");
     const b = await chromium.launch();
     await b.close();
     return true;
-  } catch {
+  } catch (err) {
+    if (process.env.CI) throw err;
     return false;
   }
 }

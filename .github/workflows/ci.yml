@@ -1,0 +1,72 @@
+name: CI
+
+# Every push to main and every pull request: install, build (type-checks), and run all tests,
+# including the browser tests against a local fake billing site. The live Claude eval costs money,
+# so it runs only when started by hand (Actions → CI → Run workflow → "live eval").
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      live_eval:
+        description: "Also run the live Claude eval of the expenses agent (needs the ANTHROPIC_API_KEY secret; about 15 API requests)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: initial
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: initial/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium for the browser tests
+        run: npx playwright install --with-deps chromium
+
+      - name: Build and test
+        run: npm test
+
+  live-eval:
+    name: Live Claude eval (expenses agent)
+    if: github.event_name == 'workflow_dispatch' && inputs.live_eval
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: initial/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run the eval
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: npm run eval:expenses

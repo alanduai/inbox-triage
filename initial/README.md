@@ -192,6 +192,8 @@ npm run typecheck
 ANTHROPIC_API_KEY=... npm run eval:expenses   # live check of Claude's two judgment calls (about 15 requests)
 ```
 
+CI (`.github/workflows/ci.yml`, GitHub Actions) runs on every pull request and every push to `main`: it installs with `npm ci`, installs Chromium, builds (which type-checks) and runs all tests, the browser tests included; in CI a missing Chromium fails them instead of skipping them. The live eval costs money, so it runs only when you start it: **Actions → CI → Run workflow**, tick **live eval**. It needs the repository secret `ANTHROPIC_API_KEY` (**Settings → Secrets and variables → Actions**).
+
 The code is in `src/`:
 - `gmail/`: OAuth, reading messages, parsing, links into Gmail
 - `scope.ts`: sender rules
