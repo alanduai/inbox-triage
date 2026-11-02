@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
+import { ExpensesConfigSchema } from "./expenses/config.js";
 
 export const ROLES = ["own_lawyer", "court", "opposing_counsel", "bank", "advisor", "other"] as const;
 export type Role = (typeof ROLES)[number];
@@ -88,6 +89,8 @@ const ConfigSchema = z.object({
     .default({ host: "127.0.0.1", port: 8787 }),
   // Message store, tokens and logs. Relative to the config file.
   dataDir: z.string().default("data"),
+  // The monthly expenses agent for the company (see src/expenses). Off when absent.
+  expenses: ExpensesConfigSchema.optional(),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;

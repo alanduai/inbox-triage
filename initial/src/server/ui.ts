@@ -28,6 +28,7 @@ const PAGE = String.raw`<!doctype html>
 body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 var(--sans); }
 .wrap { max-width: 1280px; margin: 0 auto; padding: 24px 16px 64px; }
 h1 { font: 400 28px/1.2 var(--serif); margin: 0; }
+.nav { float: right; font-size: 13px; color: var(--accent); }
 .take { margin: 6px 0 0; min-height: 1.4em; }
 .banner { display: inline-block; margin-top: 10px; padding: 2px 10px; border: 1px dashed var(--line); border-radius: 999px; color: var(--muted); font-size: 13px; }
 .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr)); gap: 12px; margin-top: 20px; }
@@ -95,6 +96,7 @@ td { padding: 6px 8px; border-bottom: 1px solid var(--line); } th.n, td.n { text
 <body>
 <div class="wrap">
   <header>
+    <a class="nav" href="/expenses">Monthly expenses →</a>
     <h1>Private inbox triage</h1>
     <p class="take" id="take">Loading…</p>
     <p class="banner">Phase 1: reading, triage and filing only. Nothing is sent from here; copy a reply and send it from Gmail.</p>

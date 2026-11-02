@@ -125,6 +125,54 @@ By default the dashboard only answers on the Mac mini itself. To reach it from y
 
 The connection is plain HTTP inside your home network. Don't forward the port on your router.
 
+## Monthly expenses agent (Bea Nekretnine d.o.o.)
+
+Once a month Ivana Nikolić, the company's accountant, emails a list of expenses on the bank statement that have no receipt yet. The agent finds those receipts and prepares your reply. You start it from the dashboard (**Monthly expenses →**, or `http://127.0.0.1:8787/expenses`) with **Run reconciliation**; it takes a few minutes.
+
+**It never sends anything.** The reply is saved as a Gmail draft in Ivana's thread for you to read and send. It never buys, pays, cancels, signs out or types a password on Amazon.de, Claude or OpenAI.
+
+### What a run does
+
+1. Finds Ivana's latest expenses email (from the addresses under `expenses.accountant.emails`, last 45 days). A newer "thanks, received" from her is skipped for the request before it. If you already replied to that email, the dashboard says so.
+2. Claude reads the email, in Croatian or English, with any PDF, picture or CSV she attached, and lists each expense still missing a receipt: vendor as she wrote it, date, amount, currency. If the latest email narrows the list ("još fali samo Amazon"), only what is still missing is listed. A spreadsheet attachment (.xlsx) is not read: the dashboard names it so you check it yourself.
+3. For each expense, Gmail is searched from a week before the charge to 3 days after: mail from the vendor's own domains, and mail naming the vendor with a receipt word (receipt, invoice, račun, Rechnung). Ivana's mail and your replies to her are never taken for receipts. Claude picks the receipt among the best five, or none.
+   - The receipt's PDF attachments are saved. A receipt that is only an email (no PDF) is printed to PDF, with scripts off and nothing loaded from the internet.
+   - Same currency but a different amount, or a pick Claude was unsure of: the receipt is saved but marked **Check this** and left out of the draft until you tick it. A USD receipt for a EUR charge is fine: the bank converted it, so the amounts cannot be compared.
+   - One receipt is never used for two expenses.
+4. What Gmail does not have is looked for on **Amazon.de** (the Bea Nekretnine account), **Claude** (`claude.ai/settings/billing`) and **OpenAI** (platform billing history, or the ChatGPT plan). Claude drives a browser signed in with the agent's own profile, with tools that can only open this portal's pages, click links, choose a filter and download. Checked in code, not left to the model: other sites are refused; checkout, cart, pay, cancel, return, sign-out and payment-method pages are refused and cut at the network; buttons such as "Kaufen", "Pay now", "Cancel plan" or "Rechnung anfordern" are refused; form submissions are blocked. A sign-in page stops that portal for the rest of the run and the dashboard tells you to sign in again.
+5. Receipts are filed in `<expenses.receiptsDir>/<YYYY-MM>/`, for example `Računi/2026-10/03 2026-10-12 Claude (Anthropic) 18.00 EUR.pdf`.
+6. A reply to Ivana is saved as a Gmail draft in her thread (In-Reply-To and References set), with the receipts attached (up to 18 MB; anything over stays in the folder and is listed). It is in Croatian, lists what is attached and what is still missing, and ends with your Croatian sign-off.
+7. The dashboard shows the result, and you get a Notification Center message on the Mac mini (and on your phone if you set `notify.ntfyUrl`). Notifications carry counts only, never amounts or vendors.
+
+On the dashboard you can untick or tick each receipt and press **Update draft**: the same draft is rewritten. Running again for the same email of Ivana's also rewrites the same draft rather than adding a second one, and removes files an earlier run saved that no longer match (never a file you changed or added). Rewriting the draft replaces any edits you made to it in Gmail, so make your own changes after the last run.
+
+### Set it up
+
+1. In `config.json`, fill in the `expenses` section (see `config.example.json`): Ivana's address(es), the mailbox that gets her email and the receipts (`gmail.account`, defaults to the triage account), and `receiptsDir`, an absolute path. A folder inside Google Drive for desktop or iCloud Drive works if you want the receipts synced.
+2. Let the agent save drafts:
+   ```sh
+   npm run expenses -- auth
+   ```
+   This is a second Gmail token, `data/gmail-expenses-token.json`, so the triage service keeps its read-only one. Google has no drafts-only permission: the `gmail.compose` permission this asks for also allows sending, but the agent's code only reads mail and saves drafts. If the expenses mailbox is on a different Google Workspace domain from your OAuth app, sign-in fails with an "Internal" app; create the OAuth client in that domain instead.
+3. Install the browser once and sign in to each portal in the agent's own profile (`data/browser-profile`), on the Mac mini:
+   ```sh
+   npx playwright install chromium
+   npm run expenses -- login amazon     # sign in with the Bea Nekretnine account, then close the window
+   npm run expenses -- login claude
+   npm run expenses -- login openai
+   ```
+   Google often blocks "Sign in with Google" in automated browsers, so use email sign-in for Claude and OpenAI, or set `expenses.browser.channel` to `"chrome"` to use your installed Google Chrome. Amazon asks to sign in again from time to time; the dashboard says when.
+4. Check: `npm run expenses -- status`, or the **Setup** panel on the dashboard. Then restart the service (`deploy/install-launchd.sh` again) so the dashboard has the Run button.
+
+Vendors that recur (Granola, Wispr Flow, Notion, Claude, OpenAI, Amazon) are built in with their sending domains. Add others, or change these, under `expenses.vendors`. An expense from a vendor not in the list is still searched for by name in Gmail.
+
+You can also run it from a terminal: `npm run expenses -- run`. Only one run happens at a time, across the service and the terminal.
+
+### Privacy
+
+- **Sent to Claude:** Ivana's email and its PDF, picture or CSV attachments; for each expense, the text (up to 3,500 characters) and attachment names of up to five candidate emails; and, in the portal fallback, the text and links of the billing pages it opens. Receipt PDFs themselves are not sent.
+- **Stored on the Mac mini:** the run records (`data/expenses/runs/`), the draft token and the browser profile with your Amazon, Claude and OpenAI sessions, all in the private `data/` folder. Treat the browser profile like a password.
+
 ## Privacy and safety
 
 - **Sent to Claude:** the text of in-scope messages, up to six earlier messages in each thread, and the senders' names and addresses. Attachments are not sent; only their names and sizes are.
@@ -138,8 +186,10 @@ The connection is plain HTTP inside your home network. Don't forward the port on
 ## Development
 
 ```sh
-npm test          # builds, then runs the unit and end-to-end tests (fake Gmail and Claude)
+npm test               # builds, then runs the unit and end-to-end tests (fake Gmail and Claude; the
+                       # portal test drives a real Chromium against a local fake billing site)
 npm run typecheck
+ANTHROPIC_API_KEY=... npm run eval:expenses   # live check of Claude's two judgment calls (about 15 requests)
 ```
 
 The code is in `src/`:
@@ -152,3 +202,4 @@ The code is in `src/`:
 - `notes.ts`: keeps each thread's note in line with the store
 - `pipeline.ts`: ties the pieces together
 - `doctor.ts`: setup checks
+- `expenses/`: the monthly expenses agent: `agent.ts` runs it, `extract.ts` and `match.ts` are the two Claude calls, `search.ts` the Gmail search, `portals/` the browser fallback and its guard, `draft.ts` the reply, `service.ts` one run at a time for the dashboard

@@ -14,16 +14,19 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --disable-warning=ExperimentalWarning --test --test-reporter=spec dist/test/*.test.js",
+    "eval:expenses": "npm run build && node --disable-warning=ExperimentalWarning dist/test/eval/expenses.eval.js",
     "init": "node --disable-warning=ExperimentalWarning dist/src/cli.js init",
     "auth": "node --disable-warning=ExperimentalWarning dist/src/cli.js auth",
     "doctor": "node --disable-warning=ExperimentalWarning dist/src/cli.js doctor --online",
     "poll": "node --disable-warning=ExperimentalWarning dist/src/cli.js poll",
-    "start": "node --disable-warning=ExperimentalWarning dist/src/cli.js run"
+    "start": "node --disable-warning=ExperimentalWarning dist/src/cli.js run",
+    "expenses": "node --disable-warning=ExperimentalWarning dist/src/cli.js expenses"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.2.0",
     "@googleapis/gmail": "^22.0.2",
     "google-auth-library": "^11.3.1",
+    "playwright": "1.63.0",
     "zod": "^4.6.7"
   },
   "devDependencies": {
