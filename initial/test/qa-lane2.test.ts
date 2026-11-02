@@ -16,6 +16,7 @@ import { Store } from "../src/store/db.js";
 import { finalize } from "../src/triage/claude.js";
 import type { ModelTriage } from "../src/triage/schema.js";
 import { safeFileName } from "../src/util/files.js";
+import { localIso } from "../src/util/time.js";
 import { b64url, tempDir, testConfig } from "./helpers.js";
 
 // ---------- a small harness: fake Gmail and Claude around the real pipeline ----------
@@ -212,7 +213,11 @@ test("L2-6: an attachment that fails to download is listed and saved on a later 
   const h = harness();
   // Fails on the first download and on the retry in the same poll; works on the next poll.
   h.failAttachments(2);
-  h.add(msg({ id: "6a", from: "Elin <elin@lawfirm.example>", body: "Decision attached.", at: T0, attach: true }));
+  // Retries cover only mail received in the last week (Store.withUnsavedAttachments), so this
+  // message is dated by the real clock, not T0, or the test stops passing a week after T0.
+  const at = Date.now() - 3_600_000;
+  const day = localIso(new Date(at), h.cfg.tz).slice(0, 10);
+  h.add(msg({ id: "6a", from: "Elin <elin@lawfirm.example>", body: "Decision attached.", at, attach: true }));
   await h.pipeline.pollOnce();
   let item = h.store.get("6a")!;
   assert.equal(item.attachments[0]!.saved, false);
@@ -222,7 +227,7 @@ test("L2-6: an attachment that fails to download is listed and saved on a later 
   assert.equal(item.attachments[0]!.saved, true);
   const note = h.note(item.notePath);
   assert.doesNotMatch(note, /not saved yet/);
-  assert.match(note, /\[\[Projects\/Sweden legal matter\/attachments\/2026-10-23 Dom T 1234-26\.pdf\|Dom T 1234-26\.pdf\]\]/);
+  assert.ok(note.includes(`[[Projects/Sweden legal matter/attachments/${day} Dom T 1234-26.pdf|Dom T 1234-26.pdf]]`), note);
 });
 
 // ---------- L2-7 forwards do not close ----------
@@ -340,7 +345,8 @@ test("L2-14: oldest unanswered counts messages that could not be triaged", async
 
 test("L2-15: a message dated in the future does not push the checkpoint past now", async () => {
   const h = harness();
-  h.add(msg({ id: "15a", from: "Marija <marija@bank.example>", body: "x", at: Date.UTC(2027, 5, 1) }));
+  // Dated by the real clock: a fixed date would stop being in the future and the test would check nothing.
+  h.add(msg({ id: "15a", from: "Marija <marija@bank.example>", body: "x", at: Date.now() + 200 * 86_400_000 }));
   await h.pipeline.pollOnce();
   assert.ok(Number(h.store.getState("gmail.lastSeenEpoch")) <= Math.floor(Date.now() / 1000));
 });
