@@ -43,8 +43,18 @@ export const ExpensesConfigSchema = z.object({
       tokenFile: z.string().default("gmail-expenses-token.json"),
     })
     .prefault({}),
-  // Receipts are saved in <receiptsDir>/<YYYY-MM>/. An absolute path on the Mac mini.
+  // The folder that holds a folder per month. An absolute path on the Mac mini.
   receiptsDir: z.string().refine((p) => path.isAbsolute(p), { message: "must be an absolute path" }),
+  // Each month's folder inside receiptsDir. Tokens: {YYYY} year, {MM} month number, {Month} English
+  // name ("October"), {Mjesec} Croatian name ("Listopad"). "/" makes a subfolder. The default gives
+  // "2026/10 October": one folder per year, months in calendar order.
+  monthFolder: z
+    .string()
+    .trim()
+    .default("{YYYY}/{MM} {Month}")
+    .refine((p) => p.includes("{YYYY}") && /\{(MM|Month|Mjesec)\}/.test(p), { message: "must contain {YYYY} and one of {MM}, {Month} or {Mjesec}, so each month of each year has its own folder" })
+    .refine((p) => !/\{(?!YYYY\}|MM\}|Month\}|Mjesec\})/.test(p), { message: "only {YYYY}, {MM}, {Month} and {Mjesec} can be used" })
+    .refine((p) => !p.startsWith("/") && !p.split(/[\\/]/).some((part) => part === ".." || part === "." || part === ""), { message: 'must stay inside receiptsDir: no leading "/", no "." or ".." and no empty parts' }),
   // How far back to look for Ivana's latest expenses email.
   requestLookbackDays: z.number().int().min(7).max(120).default(45),
   // A receipt is looked for from this many days before the charge date to 3 days after it.

@@ -106,6 +106,7 @@
       "account": "you@example.com"
     },
     "receiptsDir": "/Users/you/Documents/Bea Nekretnine/Računi",
+    "monthFolder": "{YYYY}/{MM} {Month}",
     "browser": {
       "enabled": true,
       "headless": true

@@ -160,7 +160,7 @@ export class ExpenseAgent {
     }
     const { message, extraction, unread } = found;
     run.period = extraction.period;
-    run.folder = monthFolder(this.x.receiptsDir, run.period);
+    run.folder = monthFolder(this.x.receiptsDir, run.period, this.x.monthFolder);
     run.request = {
       messageId: message.id,
       threadId: message.threadId,
@@ -323,7 +323,7 @@ export class ExpenseAgent {
     const m = best.find((c) => c.message.id === choice.candidateId)!.message;
     const files = [];
     const notes: string[] = [];
-    const folder = monthFolder(this.x.receiptsDir, run.period);
+    const folder = monthFolder(this.x.receiptsDir, run.period, this.x.monthFolder);
     for (const name of choice.attachments) {
       const ref = m.attachments.find((a) => a.filename === name);
       if (!ref) continue;
@@ -372,7 +372,7 @@ export class ExpenseAgent {
       line.note = `${line.note} ${name}: ${r.note || "not found"}`.trim();
       return;
     }
-    const folder = monthFolder(this.x.receiptsDir, run.period);
+    const folder = monthFolder(this.x.receiptsDir, run.period, this.x.monthFolder);
     line.files = r.files.map((f, i) => {
       const data = fs.readFileSync(f.path);
       const ext = isPdf(data) ? ".pdf" : `.${isImage(data) ?? "bin"}`;

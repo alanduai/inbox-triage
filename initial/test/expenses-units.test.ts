@@ -9,7 +9,7 @@ import { EXTRACTION_JSON_SCHEMA, extractionContent, finalizeExtraction, looksLik
 import { CHOICE_JSON_SCHEMA, finalizeChoice, reviewReason } from "../src/expenses/match.js";
 import { buildMime, dateHr, draftBody, encodeHeader, periodHr, replySubject } from "../src/expenses/draft.js";
 import { checkUrl, isSignInUrl, PORTALS, riskyLabel } from "../src/expenses/portals/guard.js";
-import { emailAsHtml, receiptFileName, removeStale, saveReceipt } from "../src/expenses/receipts.js";
+import { emailAsHtml, monthFolder, receiptFileName, removeStale, saveReceipt } from "../src/expenses/receipts.js";
 import { RunStore, newRunId } from "../src/expenses/runs.js";
 import { parseConfig } from "../src/config.js";
 import { tempDir, testConfig } from "./helpers.js";
@@ -283,6 +283,18 @@ test("a receipt email printed to PDF keeps its headers and drops scripts", () =>
   assert.doesNotMatch(html, /<script>alert/);
 });
 
+test("month folders: one per month of each year, named by the pattern, always inside the receipts folder", () => {
+  const root = "/Users/alan/Documents/Bea Nekretnine/Računi";
+  assert.equal(monthFolder(root, "2026-10"), `${root}/2026/10 October`);
+  assert.equal(monthFolder(root, "2026-11"), `${root}/2026/11 November`);
+  assert.equal(monthFolder(root, "2027-01"), `${root}/2027/01 January`);
+  assert.equal(monthFolder(root, "2026-12", "{YYYY}/{MM} {Mjesec}"), `${root}/2026/12 Prosinac`);
+  assert.equal(monthFolder(root, "2026-10", "{Month} {YYYY}"), `${root}/October 2026`);
+  assert.equal(monthFolder(root, "2026-10", "{YYYY}-{MM}"), `${root}/2026-10`);
+  assert.equal(monthFolder(root, "2026-10", "{YYYY}/../{MM}"), `${root}/2026/10`, "never outside receiptsDir");
+  assert.throws(() => monthFolder(root, "2026-13"), /Not a period/);
+});
+
 // ---------- runs and config ----------
 
 test("runs are stored per id, newest first, and a run left running by a stopped service is marked failed", () => {
@@ -309,5 +321,9 @@ test("config: the expenses section is optional and checked when present", () => 
   assert.equal(x.browser.enabled, true);
   assert.equal(x.gmail.tokenFile, "gmail-expenses-token.json");
   assert.throws(() => parseConfig({ ...base, expenses: { ...withX.expenses, receiptsDir: "Računi" } }, "/tmp/c.json"), /absolute path/);
+  assert.equal(x.monthFolder, "{YYYY}/{MM} {Month}");
+  for (const [bad, why] of [["{Month}", /must contain \{YYYY\}/], ["{YYYY}", /must contain/], ["{YYYY}/{Monat}", /only \{YYYY\}/], ["/{YYYY}/{MM}", /inside receiptsDir/], ["{YYYY}/../{MM}", /inside receiptsDir/]] as const) {
+    assert.throws(() => parseConfig({ ...base, expenses: { ...withX.expenses, monthFolder: bad } }, "/tmp/c.json"), why, bad);
+  }
   assert.throws(() => parseConfig({ ...base, expenses: { accountant: { emails: ["not an address"] }, receiptsDir: "/x" } }, "/tmp/c.json"), /email address/);
 });

@@ -112,7 +112,7 @@ function harness(opts: { outcomes?: Record<string, PortalResult["status"]>; extr
       stagingRoot: path.join(cfg.dataDirAbs, "expenses", "staging"),
       now: () => new Date((clock += 1000)),
     });
-  const folder = path.join(cfg.expenses!.receiptsDir, "2026-10");
+  const folder = path.join(cfg.expenses!.receiptsDir, "2026", "10 October");
   const files = () => (fs.existsSync(folder) ? fs.readdirSync(folder).sort() : []);
   return { cfg, mailbox, claude, portals, renderer, notices, runs, agent, folder, files };
 }
@@ -138,6 +138,7 @@ test("a month end to end: receipts from Gmail and Claude's billing page, filed, 
 
   assert.equal(run.status, "completed_with_gaps");
   assert.equal(run.period, "2026-10");
+  assert.equal(run.folder, h.folder, "October's receipts are in the October folder");
   assert.equal(run.request?.messageId, req.id);
   assert.equal(run.request?.alreadyAnswered, false);
   assert.match(run.request!.link, /^https:\/\/mail\.google\.com\//);
@@ -325,8 +326,44 @@ test("two charges from the same vendor get two different receipts", async () => 
     runs: h.runs,
     notify: async () => [],
     stagingRoot: path.join(h.cfg.dataDirAbs, "staging"),
+    now: () => new Date(NOW),
   });
   const run = await agent.run("cli");
   assert.deepEqual(run.lines.map((l) => l.files[0] && fs.readFileSync(l.files[0].path).toString()), [PDF("a").toString(), PDF("b").toString()]);
   assert.equal(run.status, "completed");
+});
+
+test("each month gets its own folder: November's receipts never land in October's", async () => {
+  const november = {
+    is_receipt_request: true,
+    period: "2026-11",
+    expenses: [{ vendor: "GRANOLA.AI", description: "Granola subscription", date: "2026-11-03", amount: "14.00", currency: "USD", source_text: "03.11. GRANOLA.AI 14,00 USD" }],
+    other_requests: "",
+  };
+  const answers: Record<string, unknown>[] = [EXTRACTED, november];
+  const h = harness({ extract: () => answers.shift() ?? new Error("no more") });
+  addMonth(h);
+  const october = await h.agent().run("dashboard");
+  // A month later Ivana asks for November.
+  h.mailbox.addMail({ from: IVANA, subject: "Računi za studeni 2026", text: "Bok, fali račun za Granolu iz studenog.", at: NOW + 60_000 });
+  h.mailbox.addMail({ from: "Granola <billing@granola.ai>", subject: "Your Granola receipt #GR-2", text: "Thanks! Amount paid $14.00 on November 3, 2026.", at: Date.UTC(2026, 10, 3, 9), attachments: [{ filename: "Invoice-GR-2.pdf", data: PDF("granola november") }] });
+  const nov = await h.agent().run("dashboard");
+
+  const root = h.cfg.expenses!.receiptsDir;
+  assert.equal(october.folder, path.join(root, "2026", "10 October"));
+  assert.equal(nov.folder, path.join(root, "2026", "11 November"));
+  assert.deepEqual(fs.readdirSync(nov.folder), ["01 2026-11-03 Granola 14.00 USD.pdf"]);
+  assert.ok(fs.readFileSync(path.join(nov.folder, "01 2026-11-03 Granola 14.00 USD.pdf")).equals(PDF("granola november")));
+  assert.equal(h.files().length, 6, "October's folder is left as it was");
+  assert.deepEqual(fs.readdirSync(root).sort(), ["2026"]);
+  assert.deepEqual(fs.readdirSync(path.join(root, "2026")).sort(), ["10 October", "11 November"]);
+  assert.equal(h.mailbox.creates, 2, "a separate draft answers each of her emails");
+});
+
+test("the month folder follows the pattern in config, for example Croatian month names", async () => {
+  const h = harness({ overrides: { monthFolder: "{YYYY}/{MM} {Mjesec}" } });
+  addMonth(h);
+  const run = await h.agent().run("dashboard");
+  assert.equal(run.folder, path.join(h.cfg.expenses!.receiptsDir, "2026", "10 Listopad"));
+  assert.equal(fs.readdirSync(run.folder).length, 6);
 });

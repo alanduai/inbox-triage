@@ -7,9 +7,26 @@ import { localStamp } from "../util/time.js";
 import { formatPlain } from "./money.js";
 import type { ExpenseLine, SavedFile } from "./types.js";
 
-export function monthFolder(receiptsDir: string, period: string): string {
-  if (!/^\d{4}-\d{2}$/.test(period)) throw new Error(`Not a period: ${period}`);
-  return path.join(receiptsDir, period);
+const MONTHS_EN = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const MONTHS_HR = ["Siječanj", "Veljača", "Ožujak", "Travanj", "Svibanj", "Lipanj", "Srpanj", "Kolovoz", "Rujan", "Listopad", "Studeni", "Prosinac"];
+
+export const DEFAULT_MONTH_FOLDER = "{YYYY}/{MM} {Month}";
+
+/**
+ * The folder for one month's receipts: receiptsDir plus the pattern filled in, for example
+ * ".../Računi/2026/10 October". Each part is made safe as a file name, so it stays inside receiptsDir.
+ */
+export function monthFolder(receiptsDir: string, period: string, pattern = DEFAULT_MONTH_FOLDER): string {
+  const m = period.match(/^(\d{4})-(0[1-9]|1[0-2])$/);
+  if (!m) throw new Error(`Not a period: ${period}`);
+  const month = Number(m[2]) - 1;
+  const filled = pattern.replace(/\{(YYYY|MM|Month|Mjesec)\}/g, (_, t: string) => (t === "YYYY" ? m[1]! : t === "MM" ? m[2]! : t === "Month" ? MONTHS_EN[month]! : MONTHS_HR[month]!));
+  const parts = filled
+    .split(/[\\/]/)
+    .filter((p) => p.trim() && p.trim() !== "." && p.trim() !== "..")
+    .map((p) => safeFileName(p, 120));
+  if (!parts.length) throw new Error(`The month folder pattern "${pattern}" gives no folder name`);
+  return path.join(receiptsDir, ...parts);
 }
 
 /** "03 2026-10-05 Notion 10.00 USD.pdf"; a second file of the same line gets the original name too. */

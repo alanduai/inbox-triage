@@ -10,6 +10,7 @@ import { ExpenseMailbox } from "./gmail.js";
 import { systemNotifier } from "./notify.js";
 import { anthropicCreate, BrowserPortalFetcher, PlaywrightBrowser } from "./portals/browser.js";
 import { PdfRenderer } from "./render.js";
+import { monthFolder } from "./receipts.js";
 import { RunStore } from "./runs.js";
 import type { ExpenseRun } from "./types.js";
 
@@ -136,7 +137,7 @@ export function setupChecks(cfg: LoadedConfig): SetupCheck[] {
   const parent = path.dirname(x.receiptsDir);
   checks.push(
     fs.existsSync(x.receiptsDir) || fs.existsSync(parent)
-      ? { name: "Receipts folder", level: "ok", detail: `${x.receiptsDir}/<month>` }
+      ? { name: "Receipts folder", level: "ok", detail: `A folder per month, for example ${monthFolder(x.receiptsDir, "2026-10", x.monthFolder)}` }
       : { name: "Receipts folder", level: "fail", detail: `${parent} does not exist. Create it or change expenses.receiptsDir.` },
   );
   if (!x.browser.enabled) checks.push({ name: "Amazon.de, Claude, OpenAI", level: "warn", detail: "The browser fallback is off; only Gmail is searched." });

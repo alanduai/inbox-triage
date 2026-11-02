@@ -140,7 +140,7 @@ Once a month Ivana Nikolić, the company's accountant, emails a list of expenses
    - Same currency but a different amount, or a pick Claude was unsure of: the receipt is saved but marked **Check this** and left out of the draft until you tick it. A USD receipt for a EUR charge is fine: the bank converted it, so the amounts cannot be compared.
    - One receipt is never used for two expenses.
 4. What Gmail does not have is looked for on **Amazon.de** (the Bea Nekretnine account), **Claude** (`claude.ai/settings/billing`) and **OpenAI** (platform billing history, or the ChatGPT plan). Claude drives a browser signed in with the agent's own profile, with tools that can only open this portal's pages, click links, choose a filter and download. Checked in code, not left to the model: other sites are refused; checkout, cart, pay, cancel, return, sign-out and payment-method pages are refused and cut at the network; buttons such as "Kaufen", "Pay now", "Cancel plan" or "Rechnung anfordern" are refused; form submissions are blocked. A sign-in page stops that portal for the rest of the run and the dashboard tells you to sign in again.
-5. Receipts are filed in `<expenses.receiptsDir>/<YYYY-MM>/`, for example `Računi/2026-10/03 2026-10-12 Claude (Anthropic) 18.00 EUR.pdf`.
+5. Receipts are filed in a folder per month inside `expenses.receiptsDir`, one folder per year: `Računi/2026/10 October/`, `Računi/2026/11 November/`, `Računi/2026/12 December/` and so on, for example `Računi/2026/10 October/03 2026-10-12 Claude (Anthropic) 18.00 EUR.pdf`. The month is the one Ivana's email asks about, so a run for her November list never writes into October. Change the layout with `expenses.monthFolder`: `{YYYY}` year, `{MM}` month number, `{Month}` English name, `{Mjesec}` Croatian name (`Listopad`), `/` for a subfolder. The default is `{YYYY}/{MM} {Month}`; `{Month} {YYYY}` gives flat folders such as `October 2026`. The year must be in it, so next October never mixes with this one.
 6. A reply to Ivana is saved as a Gmail draft in her thread (In-Reply-To and References set), with the receipts attached (up to 18 MB; anything over stays in the folder and is listed). It is in Croatian, lists what is attached and what is still missing, and ends with your Croatian sign-off.
 7. The dashboard shows the result, and you get a Notification Center message on the Mac mini (and on your phone if you set `notify.ntfyUrl`). Notifications carry counts only, never amounts or vendors.
 
@@ -148,7 +148,7 @@ On the dashboard you can untick or tick each receipt and press **Update draft**:
 
 ### Set it up
 
-1. In `config.json`, fill in the `expenses` section (see `config.example.json`): Ivana's address(es), the mailbox that gets her email and the receipts (`gmail.account`, defaults to the triage account), and `receiptsDir`, an absolute path. A folder inside Google Drive for desktop or iCloud Drive works if you want the receipts synced.
+1. In `config.json`, fill in the `expenses` section (see `config.example.json`): Ivana's address(es), the mailbox that gets her email and the receipts (`gmail.account`, defaults to the triage account), and `receiptsDir`, an absolute path that will hold the month folders. A folder inside Google Drive for desktop or iCloud Drive works if you want the receipts synced.
 2. Let the agent save drafts:
    ```sh
    npm run expenses -- auth
