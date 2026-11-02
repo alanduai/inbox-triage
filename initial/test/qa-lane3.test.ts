@@ -79,8 +79,9 @@ test("your urgency correction drives the dashboard, and the agreement rate count
     { ...base, urgency: "urgent", urgency_score: 90 },
     { ...base, urgency: "urgent", urgency_score: 85 },
   ]);
-  msgs.set("3a", parseMessage(raw("3a", "Bank <info@bank.example>", "A", "a", Date.UTC(2026, 9, 22, 8))));
-  msgs.set("3b", parseMessage(raw("3b", "Bank <info@bank.example>", "B", "b", Date.UTC(2026, 9, 22, 9))));
+  // The agreement rate counts the last 14 days of mail, so these are dated by the real clock.
+  msgs.set("3a", parseMessage(raw("3a", "Bank <info@bank.example>", "A", "a", Date.now() - 2 * 3_600_000)));
+  msgs.set("3b", parseMessage(raw("3b", "Bank <info@bank.example>", "B", "b", Date.now() - 3_600_000)));
   await pipeline.pollOnce();
   const { server, base: url } = await serve(store);
   try {
